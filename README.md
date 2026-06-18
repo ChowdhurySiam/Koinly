@@ -444,7 +444,7 @@ The repository includes:
 Add this repository variable before running the workflow:
 
 ```text
-KOINLY_SYNC_API_BASE_URL=https://<your-worker>.workers.dev
+KOINLY_SYNC_API_BASE_URL=https://<yourworker>.workers.dev
 ```
 
 Path:
