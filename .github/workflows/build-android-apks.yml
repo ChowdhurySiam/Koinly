@@ -1,4 +1,4 @@
-name: Build Android APKs
+name: Build Android APKs and Windows Installer
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ on:
     paths:
       - "lib/**"
       - "android/**"
+      - "windows/**"
       - "assets/**"
       - "pubspec.yaml"
       - "pubspec.lock"
@@ -50,16 +51,24 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Restore Android Gradle wrapper files
+        run: |
+          flutter create --platforms=android --project-name koinly_flutter .
+          git checkout -- android/app/build.gradle android/build.gradle android/settings.gradle android/gradle.properties android/app/src/main/AndroidManifest.xml || true
+          rm -f android/build.gradle.kts android/settings.gradle.kts android/app/build.gradle.kts
+          find android/app/src/main/res -type f \( -name "ic_launcher.png" -o -name "ic_launcher_round.png" -o -name "ic_launcher_foreground.png" \) -delete
+          chmod +x android/gradlew
+
       - name: Force Gradle wrapper 8.14.1
         run: |
           mkdir -p android/gradle/wrapper
-          cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF_GRADLE'
           distributionBase=GRADLE_USER_HOME
           distributionPath=wrapper/dists
           zipStoreBase=GRADLE_USER_HOME
           zipStorePath=wrapper/dists
           distributionUrl=https\://services.gradle.org/distributions/gradle-8.14.1-bin.zip
-          EOF
+          EOF_GRADLE
 
       - name: Show Flutter version
         run: flutter --version
@@ -100,9 +109,302 @@ jobs:
       - name: List APK artifacts
         run: ls -lh artifacts
 
+      - name: Verify APK signatures
+        run: |
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::warning::apksigner was not found at $APKSIGNER; skipping signature verification."
+            exit 0
+          fi
+          for apk in artifacts/*.apk; do
+            echo "Verifying $apk"
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
+
       - name: Upload release APKs
         uses: actions/upload-artifact@v4
         with:
           name: koinly-release-apks
           path: artifacts/*.apk
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows x64 installer EXE
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show Flutter version
+        run: flutter --version
+
+      - name: Enable Windows desktop support
+        run: flutter config --enable-windows-desktop
+
+      - name: Generate Windows platform files
+        run: flutter create --platforms=windows --project-name koinly_flutter .
+
+      - name: Apply Koinly Windows app icon
+        shell: pwsh
+        run: |
+          $iconSource = "assets/icons/app_icon.ico"
+          $iconDest = "windows/runner/resources/app_icon.ico"
+          if (!(Test-Path $iconSource)) {
+            throw "Windows icon source was not found: $iconSource"
+          }
+          if (!(Test-Path "windows/runner/resources")) {
+            New-Item -ItemType Directory -Force "windows/runner/resources" | Out-Null
+          }
+          Copy-Item -Path $iconSource -Destination $iconDest -Force
+          if (!(Test-Path $iconDest)) {
+            throw "Windows icon was not copied: $iconDest"
+          }
+
+      - name: Patch Windows CMake for CMake 4/Firebase compatibility
+        shell: pwsh
+        run: |
+          $cmakeFile = "windows/CMakeLists.txt"
+          if (!(Test-Path $cmakeFile)) {
+            throw "Windows CMakeLists.txt was not generated: $cmakeFile"
+          }
+
+          $content = Get-Content $cmakeFile -Raw
+          if ($content -notmatch "CMAKE_POLICY_VERSION_MINIMUM") {
+            $lines = Get-Content $cmakeFile
+            $patched = New-Object System.Collections.Generic.List[string]
+            $inserted = $false
+
+            foreach ($line in $lines) {
+              $patched.Add($line)
+              if (!$inserted -and $line -match "^cmake_minimum_required\(VERSION") {
+                $patched.Add("")
+                $patched.Add("# Firebase's bundled Windows C++ SDK still declares an older CMake policy.")
+                $patched.Add("# CMake 4 rejects that by default, so keep policy compatibility at 3.5.")
+                $patched.Add('set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum CMake policy version for legacy Firebase C++ SDK")')
+                $patched.Add("")
+                $patched.Add("# Older Flutter Windows plugins can include MSVC's deprecated experimental coroutine header.")
+                $patched.Add("# Visual Studio 2026/MSVC 14.51 treats that as a hard error unless this macro is defined.")
+                $patched.Add('add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)')
+                $patched.Add("")
+                $inserted = $true
+              }
+            }
+
+            Set-Content -Path $cmakeFile -Value $patched -Encoding UTF8
+          }
+
+          Get-Content $cmakeFile -TotalCount 24
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Prepare optional Windows code signing
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX_BASE64: ${{ secrets.WINDOWS_CODESIGN_PFX_BASE64 }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ vars.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_PFX_BASE64)) {
+            Write-Host "::warning::WINDOWS_CODESIGN_PFX_BASE64 is not configured. The installer will build unsigned, and Microsoft Defender SmartScreen can still show 'Windows protected your PC'."
+            "WINDOWS_SIGNING_ENABLED=false" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODESIGN_PASSWORD)) {
+            throw "WINDOWS_CODESIGN_PASSWORD is required when WINDOWS_CODESIGN_PFX_BASE64 is configured."
+          }
+
+          $timestampUrl = $env:WINDOWS_CODESIGN_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+            $timestampUrl = "http://timestamp.digicert.com"
+          }
+
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match "\\x64\\signtool.exe$" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if ($null -eq $signtool) {
+            throw "signtool.exe was not found in the Windows SDK installation."
+          }
+
+          New-Item -ItemType Directory -Force signing | Out-Null
+          $certPath = (Join-Path (Resolve-Path "signing").Path "windows-codesign.pfx")
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_PFX_BASE64))
+
+          "WINDOWS_SIGNING_ENABLED=true" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_SIGNTOOL_PATH=$($signtool.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_CODESIGN_CERT=$certPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "WINDOWS_CODESIGN_TIMESTAMP_URL=$timestampUrl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Windows code signing is enabled. SignTool: $($signtool.FullName)"
+
+      - name: Build Windows release
+        env:
+          KOINLY_SYNC_API_BASE_URL: ${{ github.event.inputs.sync_api_base_url || vars.KOINLY_SYNC_API_BASE_URL || secrets.KOINLY_SYNC_API_BASE_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KOINLY_SYNC_API_BASE_URL)) {
+            Write-Host "::warning::KOINLY_SYNC_API_BASE_URL is empty. The Windows app will build, but online sync will show a backend URL configuration error until you rebuild with the Worker URL."
+          }
+          $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+          $env:CL = "/D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
+          flutter build windows --release --dart-define=KOINLY_SYNC_API_BASE_URL="$env:KOINLY_SYNC_API_BASE_URL"
+
+      - name: Normalize Windows release executable name
+        shell: pwsh
+        run: |
+          $releaseDir = Resolve-Path "build/windows/x64/runner/Release"
+          $defaultExe = Join-Path $releaseDir "koinly_flutter.exe"
+          $namedExe = Join-Path $releaseDir "Koinly.exe"
+          if (Test-Path $defaultExe) {
+            Move-Item -Path $defaultExe -Destination $namedExe -Force
+          }
+          if (!(Test-Path $namedExe)) {
+            throw "Expected Windows executable was not found: $namedExe"
+          }
+          Get-ChildItem $releaseDir | Format-Table Name,Length
+
+      - name: Sign Windows app executable if certificate is configured
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+        run: |
+          if ($env:WINDOWS_SIGNING_ENABLED -ne "true") {
+            Write-Host "Skipping Windows app signing because WINDOWS_CODESIGN_PFX_BASE64 is not configured."
+            exit 0
+          }
+
+          $exe = (Resolve-Path "build/windows/x64/runner/Release/Koinly.exe").Path
+          & "$env:WINDOWS_SIGNTOOL_PATH" sign /f "$env:WINDOWS_CODESIGN_CERT" /p "$env:WINDOWS_CODESIGN_PASSWORD" /fd SHA256 /tr "$env:WINDOWS_CODESIGN_TIMESTAMP_URL" /td SHA256 "$exe"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign Koinly.exe" }
+
+          & "$env:WINDOWS_SIGNTOOL_PATH" verify /pa /v "$exe"
+          if ($LASTEXITCODE -ne 0) { throw "Koinly.exe signature verification failed" }
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            throw "ISCC.exe was not found after installing Inno Setup: $iscc"
+          }
+          "ISCC_PATH=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build Windows installer EXE
+        shell: pwsh
+        run: |
+          $releaseDir = Resolve-Path "build/windows/x64/runner/Release"
+          if (!(Test-Path $releaseDir)) {
+            throw "Windows release directory was not found: $releaseDir"
+          }
+
+          $namedExe = Join-Path $releaseDir "Koinly.exe"
+          if (!(Test-Path $namedExe)) {
+            throw "Expected Windows executable was not found before installer packaging: $namedExe"
+          }
+
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $sourceDir = $releaseDir.Path
+          $outputDir = (Resolve-Path "artifacts").Path
+          $iconFile = (Resolve-Path "assets/icons/app_icon.ico").Path
+          $pubspecVersionLine = (Get-Content "pubspec.yaml" | Where-Object { $_ -match "^version:" } | Select-Object -First 1)
+          if ([string]::IsNullOrWhiteSpace($pubspecVersionLine)) {
+            throw "pubspec.yaml version was not found."
+          }
+          $fullAppVersion = ($pubspecVersionLine -replace "^version:\s*", "").Trim()
+          $appVersionName = ($fullAppVersion -split "\+")[0]
+          if ([string]::IsNullOrWhiteSpace($appVersionName)) {
+            throw "Could not parse installer version from pubspec.yaml version: $fullAppVersion"
+          }
+          Write-Host "Packaging Koinly Windows installer version $appVersionName from pubspec version $fullAppVersion"
+          $iss = @"
+          #define SourceDir "$sourceDir"
+          #define OutputDir "$outputDir"
+          #define IconFile "$iconFile"
+          #define MyAppName "Koinly"
+          #define MyAppVersion "$appVersionName"
+          #define MyAppExeName "Koinly.exe"
+
+          [Setup]
+          AppId={{D0F34749-64D8-4B0E-BBA3-026F8B4392C8}
+          AppName={#MyAppName}
+          AppVersion={#MyAppVersion}
+          AppPublisher=Koinly
+          DefaultDirName={localappdata}\Programs\Koinly
+          DefaultGroupName={#MyAppName}
+          DisableWelcomePage=no
+          DisableDirPage=no
+          DisableProgramGroupPage=no
+          DisableReadyPage=no
+          DisableFinishedPage=no
+          OutputDir={#OutputDir}
+          OutputBaseFilename=KoinlySetup
+          SetupIconFile={#IconFile}
+          UninstallDisplayIcon={app}\{#MyAppExeName}
+          VersionInfoDescription=Koinly Installer
+          VersionInfoProductName=Koinly
+          VersionInfoCompany=Koinly
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional icons:"; Flags: unchecked
+
+          [Files]
+          Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
+          Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+          "@
+          $iss = ($iss -split "`r?`n" | ForEach-Object { $_.TrimStart() }) -join "`r`n"
+          Set-Content -Path "artifacts/koinly-installer.iss" -Value $iss -Encoding UTF8
+          & "$env:ISCC_PATH" "artifacts/koinly-installer.iss"
+          if (!(Test-Path "artifacts/KoinlySetup.exe")) {
+            throw "Installer was not created: artifacts/KoinlySetup.exe"
+          }
+          Get-ChildItem artifacts | Format-Table Name,Length
+
+      - name: Sign Windows installer if certificate is configured
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+        run: |
+          if ($env:WINDOWS_SIGNING_ENABLED -ne "true") {
+            Write-Host "Skipping Windows installer signing because WINDOWS_CODESIGN_PFX_BASE64 is not configured."
+            exit 0
+          }
+
+          $installer = (Resolve-Path "artifacts/KoinlySetup.exe").Path
+          & "$env:WINDOWS_SIGNTOOL_PATH" sign /f "$env:WINDOWS_CODESIGN_CERT" /p "$env:WINDOWS_CODESIGN_PASSWORD" /fd SHA256 /tr "$env:WINDOWS_CODESIGN_TIMESTAMP_URL" /td SHA256 "$installer"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to sign KoinlySetup.exe" }
+
+          & "$env:WINDOWS_SIGNTOOL_PATH" verify /pa /v "$installer"
+          if ($LASTEXITCODE -ne 0) { throw "KoinlySetup.exe signature verification failed" }
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: koinly-windows-installer
+          path: artifacts/KoinlySetup.exe
           if-no-files-found: error

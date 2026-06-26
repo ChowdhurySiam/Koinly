@@ -15,8 +15,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
+import 'package:mongo_dart/mongo_dart.dart' as mongo;
 import 'package:local_auth/local_auth.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -27,6 +29,7 @@ import 'package:provider/provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite/sqflite.dart' as sql;
+import 'package:sqflite_common_ffi/sqflite_ffi.dart' as sqflite_ffi;
 import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:url_launcher/url_launcher.dart';
@@ -45,12 +48,27 @@ const Color kSleekWarning = Color(0xFFF59E0B);
 const Color kSleekMuted = Color(0xFF7C8A92);
 
 const appTitle = 'Koinly';
-const appVersion = '1.0.0';
+const appVersion = '1.0.67';
 const backupPassword = 'YOUR_SECRET_PASSWORD';
 const kSyncAdminTelegramUrl = 'https://t.me/Ch0wdhury_Siam';
 
+bool get kUsesDesktopSqlite => !kIsWeb && (Platform.isWindows || Platform.isLinux);
+bool get kIsDesktopApp => !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+bool get kSupportsLocalNotifications => !kIsWeb && Platform.isAndroid;
+
+// Desktop builds store SharedPreferences separately from Android. Older Windows
+// builds could inherit `onboardingCompleted=true` and skip the setup flow.
+// Bumping this desktop setup marker forces the setup pages to appear once on PC
+// without resetting mobile users or deleting any finance data. Revision 20260621 also
+// corrects installs that previously skipped the Windows setup flow.
+const int kRequiredDesktopSetupVersion = 20260623;
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  if (kUsesDesktopSqlite) {
+    sqflite_ffi.sqfliteFfiInit();
+    sql.databaseFactory = sqflite_ffi.databaseFactoryFfi;
+  }
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
@@ -82,14 +100,20 @@ Future<void> main() async {
 // Models
 // -----------------------------------------------------------------------------
 
-enum AccountType { regular, credit }
+enum AccountType { regular, credit, savings }
 enum CategoryType { income, expense }
 enum MoneyTransactionType { income, expense, transfer }
 enum LoanType { given, taken }
 enum LoanStatus { open, completed }
 enum DateRangeType { today, thisWeek, thisMonth, thisYear, allTime, custom }
+enum FinancialHealthPeriod { monthly, yearly }
 enum CurrencyPosition { prefix, suffix }
 enum ThemePreference { system, light, dark, batterySaver }
+enum SyncDatabaseProvider { turso, mongoDb, local, cloudflareD1, supabase, neonPostgres, firebaseFirestore }
+
+const List<SyncDatabaseProvider> userSyncDatabaseProviders = [
+  SyncDatabaseProvider.mongoDb,
+];
 
 String enumName(Object value) => value.toString().split('.').last;
 
@@ -100,6 +124,71 @@ T enumByName<T>(Iterable<T> values, String? name, T fallback) {
   }
   return fallback;
 }
+
+String syncDatabaseProviderLabel(SyncDatabaseProvider provider) {
+  switch (provider) {
+    case SyncDatabaseProvider.turso:
+      return 'Turso Database (hidden)';
+    case SyncDatabaseProvider.mongoDb:
+      return 'MongoDB Database';
+    case SyncDatabaseProvider.local:
+      return 'Local Database';
+    case SyncDatabaseProvider.cloudflareD1:
+      return 'Cloudflare D1';
+    case SyncDatabaseProvider.supabase:
+      return 'Supabase Postgres';
+    case SyncDatabaseProvider.neonPostgres:
+      return 'Neon Postgres';
+    case SyncDatabaseProvider.firebaseFirestore:
+      return 'Firebase Firestore';
+  }
+}
+
+IconData syncDatabaseProviderIcon(SyncDatabaseProvider provider) {
+  switch (provider) {
+    case SyncDatabaseProvider.turso:
+      return Icons.block_rounded;
+    case SyncDatabaseProvider.mongoDb:
+      return Icons.storage_rounded;
+    case SyncDatabaseProvider.local:
+      return Icons.phone_android_rounded;
+    case SyncDatabaseProvider.cloudflareD1:
+      return Icons.cloud_queue_rounded;
+    case SyncDatabaseProvider.supabase:
+      return Icons.account_tree_rounded;
+    case SyncDatabaseProvider.neonPostgres:
+      return Icons.auto_awesome_rounded;
+    case SyncDatabaseProvider.firebaseFirestore:
+      return Icons.local_fire_department_rounded;
+  }
+}
+
+String syncDatabaseProviderSubtitle(SyncDatabaseProvider provider) {
+  switch (provider) {
+    case SyncDatabaseProvider.turso:
+      return 'Hidden for users until Turso sync is ready again.';
+    case SyncDatabaseProvider.mongoDb:
+      return 'Use a MongoDB URL to store app sync snapshots.';
+    case SyncDatabaseProvider.local:
+      return 'Keep data on this device only. No cloud credentials required.';
+    case SyncDatabaseProvider.cloudflareD1:
+      return 'Free Cloudflare database option through your Koinly Worker API.';
+    case SyncDatabaseProvider.supabase:
+      return 'Free Supabase Postgres option through your Koinly Worker API.';
+    case SyncDatabaseProvider.neonPostgres:
+      return 'Free Neon Postgres option through your Koinly Worker API.';
+    case SyncDatabaseProvider.firebaseFirestore:
+      return 'Free Firebase Firestore option through your Koinly Worker API.';
+  }
+}
+
+String redactSyncSecrets(String value) {
+  return value
+      .replaceAll(RegExp(r'mongodb(\+srv)?:\/\/[^\s\)\]\}]+', caseSensitive: false), 'mongodb://••••')
+      .replaceAll(RegExp(r'Bearer\s+[A-Za-z0-9._~+\/=-]+', caseSensitive: false), 'Bearer ••••')
+      .replaceAllMapped(RegExp(r'(token|password|auth)[=:]\s*[^,;\s]+', caseSensitive: false), (match) => '${match.group(1)}=••••');
+}
+
 
 DateTime dateFromDb(Object? value) {
   if (value == null) return DateTime.now();
@@ -571,6 +660,226 @@ class LoanRepayment {
       );
 }
 
+
+class LoanRepaymentReminder {
+  LoanRepaymentReminder({
+    required this.id,
+    required this.loanId,
+    required this.accountId,
+    required this.amount,
+    required this.dueDate,
+    required this.reminderTimeMinutes,
+    required this.notes,
+    required this.isPaid,
+    this.paidOn,
+    required this.createdOn,
+    required this.updatedOn,
+  });
+
+  final String id;
+  final String loanId;
+  final String accountId;
+  final double amount;
+  final DateTime dueDate;
+  final int reminderTimeMinutes;
+  final String notes;
+  final bool isPaid;
+  final DateTime? paidOn;
+  final DateTime createdOn;
+  final DateTime updatedOn;
+
+  bool get isOverdue {
+    if (isPaid) return false;
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final dueDay = DateTime(dueDate.year, dueDate.month, dueDate.day);
+    return dueDay.isBefore(today);
+  }
+
+  bool get isDueToday {
+    if (isPaid) return false;
+    final now = DateTime.now();
+    return dueDate.year == now.year && dueDate.month == now.month && dueDate.day == now.day;
+  }
+
+  DateTime get reminderAt {
+    final hour = reminderTimeMinutes ~/ 60;
+    final minute = reminderTimeMinutes % 60;
+    return DateTime(dueDate.year, dueDate.month, dueDate.day, hour, minute);
+  }
+
+  Map<String, Object?> toMap() => {
+        'id': id,
+        'loan_id': loanId,
+        'account_id': accountId,
+        'amount': amount,
+        'due_date': dateToDb(dueDate),
+        'reminder_time_minutes': reminderTimeMinutes,
+        'notes': notes,
+        'is_paid': isPaid ? 1 : 0,
+        'paid_on': paidOn == null ? null : dateToDb(paidOn!),
+        'created_on': dateToDb(createdOn),
+        'updated_on': dateToDb(updatedOn),
+      };
+
+  static LoanRepaymentReminder fromMap(Map<String, Object?> map) => LoanRepaymentReminder(
+        id: map['id'] as String,
+        loanId: map['loan_id'] as String? ?? '',
+        accountId: map['account_id'] as String? ?? '',
+        amount: (map['amount'] as num? ?? 0).toDouble(),
+        dueDate: dateFromDb(map['due_date']),
+        reminderTimeMinutes: (map['reminder_time_minutes'] as num? ?? (9 * 60)).toInt(),
+        notes: map['notes'] as String? ?? '',
+        isPaid: (map['is_paid'] as num? ?? 0).toInt() == 1,
+        paidOn: map['paid_on'] == null ? null : dateFromDb(map['paid_on']),
+        createdOn: dateFromDb(map['created_on']),
+        updatedOn: dateFromDb(map['updated_on']),
+      );
+
+  LoanRepaymentReminder copyWith({
+    String? id,
+    String? loanId,
+    String? accountId,
+    double? amount,
+    DateTime? dueDate,
+    int? reminderTimeMinutes,
+    String? notes,
+    bool? isPaid,
+    DateTime? paidOn,
+    DateTime? createdOn,
+    DateTime? updatedOn,
+  }) => LoanRepaymentReminder(
+        id: id ?? this.id,
+        loanId: loanId ?? this.loanId,
+        accountId: accountId ?? this.accountId,
+        amount: amount ?? this.amount,
+        dueDate: dueDate ?? this.dueDate,
+        reminderTimeMinutes: reminderTimeMinutes ?? this.reminderTimeMinutes,
+        notes: notes ?? this.notes,
+        isPaid: isPaid ?? this.isPaid,
+        paidOn: paidOn ?? this.paidOn,
+        createdOn: createdOn ?? this.createdOn,
+        updatedOn: updatedOn ?? this.updatedOn,
+      );
+}
+
+
+class SavingsSuggestionProfile {
+  const SavingsSuggestionProfile({
+    required this.completed,
+    required this.hobby,
+    required this.occupation,
+    required this.age,
+    required this.savingsGoal,
+    required this.spendingPreference,
+    required this.extraDetails,
+    required this.updatedOn,
+  });
+
+  final bool completed;
+  final String hobby;
+  final String occupation;
+  final int age;
+  final String savingsGoal;
+  final String spendingPreference;
+  final String extraDetails;
+  final DateTime? updatedOn;
+
+  static const empty = SavingsSuggestionProfile(
+    completed: false,
+    hobby: '',
+    occupation: '',
+    age: 0,
+    savingsGoal: '',
+    spendingPreference: '',
+    extraDetails: '',
+    updatedOn: null,
+  );
+
+  bool get hasPersonalDetails => hobby.trim().isNotEmpty || occupation.trim().isNotEmpty || age > 0 || savingsGoal.trim().isNotEmpty || spendingPreference.trim().isNotEmpty || extraDetails.trim().isNotEmpty;
+
+  String get shortLabel {
+    final parts = [
+      if (occupation.trim().isNotEmpty) occupation.trim(),
+      if (hobby.trim().isNotEmpty) hobby.trim(),
+      if (savingsGoal.trim().isNotEmpty) savingsGoal.trim(),
+    ];
+    if (parts.isEmpty) return completed ? 'Generic suggestions' : 'Not configured';
+    return parts.take(2).join(' • ');
+  }
+
+  Map<String, dynamic> toJson() => {
+        'completed': completed,
+        'hobby': hobby,
+        'occupation': occupation,
+        'age': age,
+        'savingsGoal': savingsGoal,
+        'spendingPreference': spendingPreference,
+        'extraDetails': extraDetails,
+        'updatedOn': updatedOn?.toIso8601String() ?? '',
+      };
+
+  static SavingsSuggestionProfile fromJson(Map<String, dynamic> json) => SavingsSuggestionProfile(
+        completed: json['completed'] as bool? ?? false,
+        hobby: json['hobby'] as String? ?? '',
+        occupation: json['occupation'] as String? ?? '',
+        age: (json['age'] as num? ?? 0).toInt(),
+        savingsGoal: json['savingsGoal'] as String? ?? '',
+        spendingPreference: json['spendingPreference'] as String? ?? '',
+        extraDetails: json['extraDetails'] as String? ?? '',
+        updatedOn: (json['updatedOn'] as String? ?? '').isEmpty ? null : DateTime.tryParse(json['updatedOn'] as String),
+      );
+
+  static SavingsSuggestionProfile fromJsonString(String raw) {
+    if (raw.trim().isEmpty) return SavingsSuggestionProfile.empty;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return SavingsSuggestionProfile.fromJson(decoded.cast<String, dynamic>());
+    } catch (_) {}
+    return SavingsSuggestionProfile.empty;
+  }
+
+  SavingsSuggestionProfile copyWith({
+    bool? completed,
+    String? hobby,
+    String? occupation,
+    int? age,
+    String? savingsGoal,
+    String? spendingPreference,
+    String? extraDetails,
+    DateTime? updatedOn,
+  }) => SavingsSuggestionProfile(
+        completed: completed ?? this.completed,
+        hobby: hobby ?? this.hobby,
+        occupation: occupation ?? this.occupation,
+        age: age ?? this.age,
+        savingsGoal: savingsGoal ?? this.savingsGoal,
+        spendingPreference: spendingPreference ?? this.spendingPreference,
+        extraDetails: extraDetails ?? this.extraDetails,
+        updatedOn: updatedOn ?? this.updatedOn,
+      );
+}
+
+class SavingsPurchaseSuggestion {
+  const SavingsPurchaseSuggestion({
+    required this.id,
+    required this.title,
+    required this.costRange,
+    required this.reason,
+    required this.savingsFit,
+    required this.iconName,
+    required this.color,
+  });
+
+  final String id;
+  final String title;
+  final String costRange;
+  final String reason;
+  final String savingsFit;
+  final String iconName;
+  final String color;
+}
+
 class DateRange {
   const DateRange(this.start, this.end, this.label);
   final DateTime? start;
@@ -616,6 +925,7 @@ class KoinlyDatabase {
         await _migrateLoanAccountSelection(database);
       },
       onOpen: (database) async {
+        await _createSchema(database);
         await _migrateLoanAccountSelection(database);
       },
     );
@@ -714,6 +1024,21 @@ class KoinlyDatabase {
         paid_on INTEGER NOT NULL,
         notes TEXT NOT NULL,
         created_on INTEGER NOT NULL
+      )
+    ''');
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS loan_repayment_reminders(
+        id TEXT PRIMARY KEY,
+        loan_id TEXT NOT NULL,
+        account_id TEXT NOT NULL DEFAULT '',
+        amount REAL NOT NULL,
+        due_date INTEGER NOT NULL,
+        reminder_time_minutes INTEGER NOT NULL DEFAULT 540,
+        notes TEXT NOT NULL,
+        is_paid INTEGER NOT NULL DEFAULT 0,
+        paid_on INTEGER,
+        created_on INTEGER NOT NULL,
+        updated_on INTEGER NOT NULL
       )
     ''');
   }
@@ -935,6 +1260,61 @@ class KoinlyDatabase {
     return maps.map(LoanRepayment.fromMap).toList();
   }
 
+  Future<List<LoanRepaymentReminder>> loanRepaymentReminders({String? loanId}) async {
+    final database = await db;
+    final maps = loanId == null
+        ? await database.query('loan_repayment_reminders', orderBy: 'is_paid ASC, due_date ASC')
+        : await database.query('loan_repayment_reminders', where: 'loan_id = ?', whereArgs: [loanId], orderBy: 'is_paid ASC, due_date ASC');
+    return maps.map(LoanRepaymentReminder.fromMap).toList();
+  }
+
+  Future<void> replacePendingLoanRepaymentReminders(String loanId, List<LoanRepaymentReminder> reminders) async {
+    final database = await db;
+    await database.transaction((txn) async {
+      await txn.delete('loan_repayment_reminders', where: 'loan_id = ? AND is_paid = 0', whereArgs: [loanId]);
+      for (final reminder in reminders) {
+        await txn.insert('loan_repayment_reminders', reminder.toMap(), conflictAlgorithm: sql.ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  Future<void> deleteLoanRepaymentReminder(String id) async {
+    await (await db).delete('loan_repayment_reminders', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> markLoanRepaymentReminderPaid(Loan loan, LoanRepaymentReminder reminder, String accountId) async {
+    if (reminder.isPaid) return;
+    final normalizedAmount = math.min(loan.remainingAmount, reminder.amount);
+    if (normalizedAmount <= 0) return;
+    final repayment = LoanRepayment(
+      id: _uuid.v4(),
+      loanId: loan.id,
+      accountId: accountId,
+      amount: normalizedAmount,
+      paidOn: DateTime.now(),
+      notes: reminder.notes,
+      createdOn: DateTime.now(),
+    );
+    final newRepaid = math.min(loan.amount, loan.repaidAmount + repayment.amount);
+    final updated = loan.copyWith(
+      repaidAmount: newRepaid,
+      status: newRepaid >= loan.amount ? LoanStatus.completed : LoanStatus.open,
+      updatedOn: DateTime.now(),
+    );
+    final database = await db;
+    await database.transaction((txn) async {
+      await txn.insert('loan_repayments', repayment.toMap());
+      await txn.update('loans', updated.toMap(), where: 'id = ?', whereArgs: [loan.id]);
+      await _applyLoanRepayment(txn, loan, repayment, 1);
+      await txn.update(
+        'loan_repayment_reminders',
+        reminder.copyWith(isPaid: true, paidOn: DateTime.now(), updatedOn: DateTime.now()).toMap(),
+        where: 'id = ?',
+        whereArgs: [reminder.id],
+      );
+    });
+  }
+
   Future<void> _applyLoanPrincipal(sql.Transaction txn, Loan loan, int direction) async {
     if (loan.accountId.isEmpty) return;
     final delta = loan.type == LoanType.taken ? loan.amount : -loan.amount;
@@ -1000,6 +1380,7 @@ class KoinlyDatabase {
       await _applyLoanPrincipal(txn, loan, -1);
       await txn.delete('transactions', where: 'loan_id = ?', whereArgs: [id]);
       await txn.delete('loan_repayments', where: 'loan_id = ?', whereArgs: [id]);
+      await txn.delete('loan_repayment_reminders', where: 'loan_id = ?', whereArgs: [id]);
       await txn.delete('loans', where: 'id = ?', whereArgs: [id]);
     });
   }
@@ -1048,7 +1429,7 @@ class KoinlyDatabase {
 
   Future<Map<String, dynamic>> exportAll() async {
     final database = await db;
-    final tables = ['accounts', 'categories', 'transactions', 'budgets', 'budget_accounts', 'budget_categories', 'loans', 'loan_repayments'];
+    final tables = ['accounts', 'categories', 'transactions', 'budgets', 'budget_accounts', 'budget_categories', 'loans', 'loan_repayments', 'loan_repayment_reminders'];
     final data = <String, dynamic>{};
     for (final table in tables) {
       data[table] = await database.query(table);
@@ -1058,7 +1439,7 @@ class KoinlyDatabase {
 
   Future<void> importAll(Map<String, dynamic> data) async {
     final database = await db;
-    final tables = ['loan_repayments', 'loans', 'budget_categories', 'budget_accounts', 'budgets', 'transactions', 'categories', 'accounts'];
+    final tables = ['loan_repayment_reminders', 'loan_repayments', 'loans', 'budget_categories', 'budget_accounts', 'budgets', 'transactions', 'categories', 'accounts'];
     await database.transaction((txn) async {
       for (final table in tables) {
         await txn.delete(table);
@@ -1090,10 +1471,44 @@ class PrefsStore {
   Future<void> setStringList(String key, List<String> value) async => (await prefs).setStringList(key, value);
 }
 
+class SecureCredentialStore {
+  SecureCredentialStore() : _storage = const FlutterSecureStorage();
+
+  final FlutterSecureStorage _storage;
+
+  static const _cloudSyncPinKey = 'koinly_cloud_sync_pin';
+  static const _mongoUrlKey = 'koinly_sync_mongodb_url';
+  static const _mongoSyncPinKey = 'koinly_sync_mongodb_pin';
+  static const _tursoAuthTokenKey = 'koinly_sync_turso_auth_token';
+
+  Future<String> readCloudSyncPin() async => await _storage.read(key: _cloudSyncPinKey) ?? '';
+  Future<void> writeCloudSyncPin(String value) => _writeOrDelete(_cloudSyncPinKey, value);
+
+  Future<String> readMongoDbUrl() async => await _storage.read(key: _mongoUrlKey) ?? '';
+  Future<void> writeMongoDbUrl(String value) => _writeOrDelete(_mongoUrlKey, value);
+
+  Future<String> readMongoDbSyncPin() async => await _storage.read(key: _mongoSyncPinKey) ?? '';
+  Future<void> writeMongoDbSyncPin(String value) => _writeOrDelete(_mongoSyncPinKey, value);
+
+  Future<String> readTursoAuthToken() async => await _storage.read(key: _tursoAuthTokenKey) ?? '';
+  Future<void> writeTursoAuthToken(String value) => _writeOrDelete(_tursoAuthTokenKey, value);
+
+  Future<void> _writeOrDelete(String key, String value) async {
+    final normalized = value.trim();
+    if (normalized.isEmpty) {
+      await _storage.delete(key: key);
+    } else {
+      await _storage.write(key: key, value: normalized);
+    }
+  }
+}
+
+
 class ReminderService {
   static final FlutterLocalNotificationsPlugin _notifications = FlutterLocalNotificationsPlugin();
 
   static Future<void> ensureInitialized() async {
+    if (!kSupportsLocalNotifications) return;
     tzdata.initializeTimeZones();
     const android = AndroidInitializationSettings('@mipmap/ic_launcher');
     const settings = InitializationSettings(android: android);
@@ -1103,6 +1518,7 @@ class ReminderService {
   }
 
   static Future<void> scheduleDaily(TimeOfDay time) async {
+    if (!kSupportsLocalNotifications) return;
     await cancel();
     final scheduled = _next(time);
     const details = NotificationDetails(
@@ -1133,7 +1549,46 @@ class ReminderService {
     return date;
   }
 
-  static Future<void> cancel() => _notifications.cancel(501);
+
+  static int _loanReminderNotificationId(String id) => 700000 + (id.hashCode.abs() % 200000);
+
+  static Future<void> scheduleLoanRepaymentReminder({required Loan loan, required LoanRepaymentReminder reminder}) async {
+    if (!kSupportsLocalNotifications || reminder.isPaid) return;
+    final scheduled = tz.TZDateTime.from(reminder.reminderAt, tz.local);
+    if (scheduled.isBefore(tz.TZDateTime.now(tz.local))) return;
+    final label = loan.type == LoanType.given ? 'Loan repayment expected' : 'Loan repayment due';
+    final body = loan.type == LoanType.given
+        ? 'Expected repayment from ${loan.personName} is due on ${DateFormat('MMM d, yyyy').format(reminder.dueDate)}.'
+        : 'Repayment to ${loan.personName} is due on ${DateFormat('MMM d, yyyy').format(reminder.dueDate)}.';
+    const details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        'loan_repayment_reminders',
+        'Loan repayment reminders',
+        channelDescription: 'Upcoming, due today, and overdue loan repayment alerts.',
+        importance: Importance.high,
+        priority: Priority.high,
+      ),
+    );
+    await _notifications.zonedSchedule(
+      _loanReminderNotificationId(reminder.id),
+      label,
+      body,
+      scheduled,
+      details,
+      androidScheduleMode: AndroidScheduleMode.inexactAllowWhileIdle,
+      uiLocalNotificationDateInterpretation: UILocalNotificationDateInterpretation.absoluteTime,
+    );
+  }
+
+  static Future<void> cancelLoanRepaymentReminder(String id) async {
+    if (!kSupportsLocalNotifications) return;
+    await _notifications.cancel(_loanReminderNotificationId(id));
+  }
+
+  static Future<void> cancel() async {
+    if (!kSupportsLocalNotifications) return;
+    await _notifications.cancel(501);
+  }
 }
 
 class ExportService {
@@ -1346,6 +1801,22 @@ class CloudSyncService {
     return payload.cast<String, dynamic>();
   }
 
+  static Future<void> testBackend(String apiBaseUrl) async {
+    final baseUrl = resolveApiBaseUrl(apiBaseUrl);
+    if (baseUrl.isEmpty || baseUrl.contains('your-koinly-sync-worker')) {
+      throw StateError('Add the Worker API URL first.');
+    }
+    final response = await http
+        .get(
+          Uri.parse(baseUrl),
+          headers: const {'accept': 'application/json'},
+        )
+        .timeout(const Duration(seconds: 18));
+    if (response.statusCode >= 500) {
+      throw StateError('Sync backend is reachable but returned a server error.');
+    }
+  }
+
   static Future<Map<String, dynamic>> _post({
     required String apiBaseUrl,
     required String path,
@@ -1377,6 +1848,144 @@ class CloudSyncService {
     }
     return data;
   }
+}
+
+class MongoDbSyncService {
+  static const String defaultDatabaseName = 'koinly';
+  static const String defaultCollectionName = 'koinly_sync_snapshots';
+  static const String snapshotDocumentId = 'koinly_latest_snapshot';
+
+  static String normalizeDatabaseName(String value) {
+    final normalized = value.trim();
+    if (normalized.isEmpty) return defaultDatabaseName;
+    return normalized.replaceAll(RegExp(r'[^a-zA-Z0-9_.-]'), '_');
+  }
+
+  static String normalizeCollectionName(String value) {
+    final normalized = value.trim();
+    if (normalized.isEmpty) return defaultCollectionName;
+    return normalized.replaceAll(RegExp(r'[^a-zA-Z0-9_.-]'), '_');
+  }
+
+  static Future<void> testConnection({
+    required String connectionString,
+    required String databaseName,
+    required String collectionName,
+  }) async {
+    final db = await _open(connectionString, databaseName);
+    try {
+      final collection = db.collection(normalizeCollectionName(collectionName));
+      await collection.findOne(mongo.where.eq('_id', '__koinly_connection_test__')).timeout(const Duration(seconds: 20));
+    } finally {
+      await db.close();
+    }
+  }
+
+  static Future<void> upload({
+    required String connectionString,
+    required String databaseName,
+    required String collectionName,
+    required Map<String, dynamic> payload,
+  }) async {
+    final db = await _open(connectionString, databaseName);
+    try {
+      final collection = db.collection(normalizeCollectionName(collectionName));
+      final now = DateTime.now().toUtc().toIso8601String();
+      await collection.replaceOne(
+        mongo.where.eq('_id', snapshotDocumentId),
+        <String, dynamic>{
+          '_id': snapshotDocumentId,
+          'payloadVersion': CloudSyncService.payloadVersion,
+          'payload': payload,
+          'deviceId': Platform.localHostname,
+          'updatedAt': now,
+        },
+        upsert: true,
+      ).timeout(const Duration(seconds: 28));
+    } finally {
+      await db.close();
+    }
+  }
+
+  static Future<Map<String, dynamic>> download({
+    required String connectionString,
+    required String databaseName,
+    required String collectionName,
+  }) async {
+    final db = await _open(connectionString, databaseName);
+    try {
+      final collection = db.collection(normalizeCollectionName(collectionName));
+      final document = await collection.findOne(mongo.where.eq('_id', snapshotDocumentId)).timeout(const Duration(seconds: 28));
+      if (document == null) {
+        throw StateError('No MongoDB sync snapshot exists yet. Upload local data first.');
+      }
+      final payload = document['payload'];
+      if (payload is! Map) {
+        throw StateError('MongoDB sync data is missing or damaged.');
+      }
+      final normalizedPayload = _normalizeBsonValue(payload);
+      if (normalizedPayload is! Map) {
+        throw StateError('MongoDB sync data is missing or damaged.');
+      }
+      return normalizedPayload.cast<String, dynamic>();
+    } finally {
+      await db.close();
+    }
+  }
+
+  static dynamic _normalizeBsonValue(dynamic value) {
+    if (value == null || value is String || value is bool || value is num) {
+      return value;
+    }
+    if (value is DateTime) {
+      return value.toIso8601String();
+    }
+    if (value is List) {
+      return value.map(_normalizeBsonValue).toList();
+    }
+    if (value is Map) {
+      return value.map((key, item) => MapEntry(key.toString(), _normalizeBsonValue(item)));
+    }
+
+    final typeName = value.runtimeType.toString();
+    if (typeName == 'Int64' || typeName.endsWith('.Int64')) {
+      return int.tryParse(value.toString()) ?? double.tryParse(value.toString()) ?? value.toString();
+    }
+    return value.toString();
+  }
+
+  static Future<mongo.Db> _open(String connectionString, String databaseName) async {
+    final normalized = connectionString.trim();
+    if (normalized.isEmpty) {
+      throw StateError('Add your MongoDB URL first.');
+    }
+    if (!normalized.startsWith('mongodb://') && !normalized.startsWith('mongodb+srv://')) {
+      throw StateError('MongoDB URL must start with mongodb:// or mongodb+srv://.');
+    }
+    final resolvedUri = _withDatabaseName(normalized, normalizeDatabaseName(databaseName));
+    final db = await mongo.Db.create(resolvedUri);
+    await db.open().timeout(const Duration(seconds: 22));
+    return db;
+  }
+
+  static String _withDatabaseName(String uri, String databaseName) {
+    final queryIndex = uri.indexOf('?');
+    final beforeQuery = queryIndex == -1 ? uri : uri.substring(0, queryIndex);
+    final query = queryIndex == -1 ? '' : uri.substring(queryIndex);
+    final schemeIndex = beforeQuery.indexOf('://');
+    if (schemeIndex == -1) return uri;
+    final hostStart = schemeIndex + 3;
+    final slashIndex = beforeQuery.indexOf('/', hostStart);
+    if (slashIndex == -1) {
+      return '$beforeQuery/$databaseName$query';
+    }
+    final path = beforeQuery.substring(slashIndex + 1).trim();
+    if (path.isEmpty) {
+      return '${beforeQuery.substring(0, slashIndex)}/$databaseName$query';
+    }
+    return uri;
+  }
+
 }
 
 Future<void> runBackupFlow(BuildContext context, AppController state) async {
@@ -1439,9 +2048,11 @@ Future<void> runRestoreFlow(BuildContext context, AppController state) async {
 class AppController extends ChangeNotifier {
   final database = KoinlyDatabase();
   final prefs = PrefsStore();
+  final secureCredentials = SecureCredentialStore();
 
   bool loading = true;
   bool onboardingCompleted = false;
+  int desktopSetupVersionCompleted = 0;
   bool authenticated = false;
   int tabIndex = 0;
   LoanType activeLoanType = LoanType.given;
@@ -1451,12 +2062,19 @@ class AppController extends ChangeNotifier {
   List<MoneyTransaction> transactions = [];
   List<Budget> budgets = [];
   List<Loan> loans = [];
+  List<LoanRepaymentReminder> loanRepaymentReminders = [];
+  SavingsSuggestionProfile savingsSuggestionProfile = SavingsSuggestionProfile.empty;
+  List<String> savedSavingsIdeas = [];
+  List<String> plannedSavingsIdeas = [];
+  List<String> seenSavingsSuggestionKeys = [];
+  List<String> dismissedFinancialHealthSummaryKeys = [];
 
   ThemePreference themePreference = ThemePreference.system;
   String currencySymbol = '৳';
   String currencyCode = 'BDT';
   CurrencyPosition currencyPosition = CurrencyPosition.suffix;
   bool useSeparators = true;
+  bool amountsHidden = false;
   DateRangeType dateRangeType = DateRangeType.thisMonth;
   DateTime? customStart;
   DateTime? customEnd;
@@ -1471,14 +2089,30 @@ class AppController extends ChangeNotifier {
   bool reminderEnabled = false;
   TimeOfDay reminderTime = const TimeOfDay(hour: 21, minute: 0);
   bool cloudSyncEnabled = false;
+  SyncDatabaseProvider syncDatabaseProvider = SyncDatabaseProvider.mongoDb;
   String cloudSyncApiBaseUrl = CloudSyncService.configuredApiBaseUrl;
   String cloudSyncId = '';
   String cloudSyncPin = '';
+  String syncMongoDbUrl = '';
+  String syncMongoDatabaseName = MongoDbSyncService.defaultDatabaseName;
+  String syncMongoCollectionName = MongoDbSyncService.defaultCollectionName;
+  String syncMongoSyncId = '';
+  String syncMongoSyncPin = '';
+  String syncTursoDatabaseUrl = '';
+  String syncTursoAuthToken = '';
   bool cloudSyncBusy = false;
+  bool cloudSyncPending = false;
   String? cloudSyncError;
   String? cloudSyncErrorCode;
   DateTime? cloudSyncLastAt;
   Timer? _cloudSyncDebounce;
+  Timer? _cloudSyncRetryTimer;
+
+  bool get setupCompletedForCurrentPlatform {
+    if (!onboardingCompleted) return false;
+    if (!kIsDesktopApp) return true;
+    return desktopSetupVersionCompleted >= kRequiredDesktopSetupVersion;
+  }
 
   Future<void> initialize() async {
     await database.db;
@@ -1494,15 +2128,25 @@ class AppController extends ChangeNotifier {
     try {
       await FirebaseAnalytics.instance.logAppOpen();
     } catch (_) {}
+    if (cloudSyncPending) {
+      _schedulePendingSyncRetry(immediate: true);
+    }
   }
 
   Future<void> _loadPreferences() async {
     onboardingCompleted = await prefs.getBool('onboardingCompleted', false);
+    desktopSetupVersionCompleted = await prefs.getInt('desktopSetupVersionCompleted', 0);
     themePreference = await prefs.getEnum('themePreference', ThemePreference.values, ThemePreference.system);
     currencySymbol = await prefs.getString('currencySymbol', '৳');
     currencyCode = await prefs.getString('currencyCode', 'BDT');
     currencyPosition = await prefs.getEnum('currencyPosition', CurrencyPosition.values, CurrencyPosition.suffix);
     useSeparators = await prefs.getBool('useSeparators', true);
+    amountsHidden = await prefs.getBool('amountsHidden', false);
+    savingsSuggestionProfile = SavingsSuggestionProfile.fromJsonString(await prefs.getString('savingsSuggestionProfile', ''));
+    savedSavingsIdeas = await prefs.getStringList('savedSavingsIdeas');
+    plannedSavingsIdeas = await prefs.getStringList('plannedSavingsIdeas');
+    seenSavingsSuggestionKeys = await prefs.getStringList('seenSavingsSuggestionKeys');
+    dismissedFinancialHealthSummaryKeys = await prefs.getStringList('dismissedFinancialHealthSummaryKeys');
     dateRangeType = await prefs.getEnum('dateRangeType', DateRangeType.values, DateRangeType.thisMonth);
     final startRaw = await prefs.getString('customStart', '');
     final endRaw = await prefs.getString('customEnd', '');
@@ -1523,22 +2167,55 @@ class AppController extends ChangeNotifier {
     final hour = await prefs.getInt('reminderHour', 21);
     final minute = await prefs.getInt('reminderMinute', 0);
     reminderTime = TimeOfDay(hour: hour, minute: minute);
-    cloudSyncEnabled = await prefs.getBool('cloudSyncEnabled', false);
+    cloudSyncEnabled = await prefs.getBool('cloudSyncEnabled', true);
+    syncDatabaseProvider = await prefs.getEnum('syncDatabaseProvider', SyncDatabaseProvider.values, SyncDatabaseProvider.mongoDb);
+    if (!userSyncDatabaseProviders.contains(syncDatabaseProvider)) {
+      syncDatabaseProvider = SyncDatabaseProvider.mongoDb;
+      cloudSyncEnabled = true;
+      await prefs.setEnum('syncDatabaseProvider', SyncDatabaseProvider.mongoDb);
+      await prefs.setBool('cloudSyncEnabled', true);
+    }
     final savedCloudSyncApiBaseUrl = await prefs.getString('cloudSyncApiBaseUrl', '');
     cloudSyncApiBaseUrl = CloudSyncService.resolveApiBaseUrl(savedCloudSyncApiBaseUrl);
     cloudSyncId = await prefs.getString('cloudSyncId', '');
-    cloudSyncPin = await prefs.getString('cloudSyncPin', '');
+    cloudSyncPin = await secureCredentials.readCloudSyncPin();
+    final legacyPin = await prefs.getString('cloudSyncPin', '');
+    if (cloudSyncPin.isEmpty && legacyPin.trim().isNotEmpty) {
+      cloudSyncPin = legacyPin.trim();
+      await secureCredentials.writeCloudSyncPin(cloudSyncPin);
+      await (await prefs.prefs).remove('cloudSyncPin');
+    }
+    syncMongoDbUrl = await secureCredentials.readMongoDbUrl();
+    syncMongoDatabaseName = MongoDbSyncService.normalizeDatabaseName(await prefs.getString('syncMongoDatabaseName', MongoDbSyncService.defaultDatabaseName));
+    syncMongoCollectionName = MongoDbSyncService.normalizeCollectionName(await prefs.getString('syncMongoCollectionName', MongoDbSyncService.defaultCollectionName));
+    syncMongoSyncId = CloudSyncService.normalizeSyncId(await prefs.getString('syncMongoSyncId', ''));
+    syncMongoSyncPin = await secureCredentials.readMongoDbSyncPin();
+    syncTursoDatabaseUrl = await prefs.getString('syncTursoDatabaseUrl', '');
+    syncTursoAuthToken = await secureCredentials.readTursoAuthToken();
+    if (syncDatabaseProvider == SyncDatabaseProvider.local) {
+      cloudSyncEnabled = false;
+    } else {
+      cloudSyncEnabled = true;
+    }
     final lastSyncRaw = await prefs.getString('cloudSyncLastAt', '');
     cloudSyncLastAt = lastSyncRaw.isEmpty ? null : DateTime.tryParse(lastSyncRaw);
+    cloudSyncPending = await prefs.getBool('cloudSyncPending', false);
   }
 
   Future<Map<String, dynamic>> exportPreferences() async => {
         'onboardingCompleted': onboardingCompleted,
+        'desktopSetupVersionCompleted': desktopSetupVersionCompleted,
         'themePreference': enumName(themePreference),
         'currencySymbol': currencySymbol,
         'currencyCode': currencyCode,
         'currencyPosition': enumName(currencyPosition),
         'useSeparators': useSeparators,
+        'amountsHidden': amountsHidden,
+        'savingsSuggestionProfile': savingsSuggestionProfile.toJson(),
+        'savedSavingsIdeas': savedSavingsIdeas,
+        'plannedSavingsIdeas': plannedSavingsIdeas,
+        'seenSavingsSuggestionKeys': seenSavingsSuggestionKeys,
+        'dismissedFinancialHealthSummaryKeys': dismissedFinancialHealthSummaryKeys,
         'dateRangeType': enumName(dateRangeType),
         'customStart': customStart?.toIso8601String() ?? '',
         'customEnd': customEnd?.toIso8601String() ?? '',
@@ -1553,12 +2230,19 @@ class AppController extends ChangeNotifier {
         'reminderEnabled': reminderEnabled,
         'reminderHour': reminderTime.hour,
         'reminderMinute': reminderTime.minute,
+        'syncDatabaseProvider': enumName(syncDatabaseProvider),
+        'syncMongoDatabaseName': syncMongoDatabaseName,
+        'syncMongoCollectionName': syncMongoCollectionName,
       };
 
   Future<void> importPreferences(Map<String, dynamic> data) async {
     final sp = await prefs.prefs;
     for (final entry in data.entries) {
       final value = entry.value;
+      if (entry.key == 'savingsSuggestionProfile' && value is Map) {
+        await sp.setString(entry.key, jsonEncode(value.cast<String, dynamic>()));
+        continue;
+      }
       if (value is bool) await sp.setBool(entry.key, value);
       if (value is int) await sp.setInt(entry.key, value);
       if (value is String) await sp.setString(entry.key, value);
@@ -1575,18 +2259,20 @@ class AppController extends ChangeNotifier {
       };
 
   String get cloudSyncStatusText {
-    if (cloudSyncBusy) return 'Syncing...';
-    if (cloudSyncErrorCode == 'SYNC_APPROVAL_REQUIRED') return 'Admin approval required';
-    if (cloudSyncError != null && cloudSyncError!.trim().isNotEmpty) return 'Error: $cloudSyncError';
-    if (!cloudSyncEnabled) return 'Disabled';
-    if (cloudSyncLastAt == null) return 'Enabled • Not synced yet';
-    return 'Enabled • Last sync ${DateFormat('yyyy-MM-dd HH:mm').format(cloudSyncLastAt!.toLocal())}';
+    if (cloudSyncBusy) return 'Online sync • Syncing...';
+    if (cloudSyncPending) return 'Online sync • Waiting for internet';
+    if (cloudSyncErrorCode == 'SYNC_APPROVAL_REQUIRED') return 'Online sync • Admin approval required';
+    if (cloudSyncError != null && cloudSyncError!.trim().isNotEmpty) return 'Online sync • Error: $cloudSyncError';
+    if (!cloudSyncEnabled) return 'Online sync • Waiting for database setup';
+    if (cloudSyncLastAt == null) return 'Online sync • Enabled • Not synced yet';
+    return 'Online sync • Last sync ${DateFormat('yyyy-MM-dd HH:mm').format(cloudSyncLastAt!.toLocal())}';
   }
 
   bool get cloudSyncApprovalRequired => cloudSyncErrorCode == 'SYNC_APPROVAL_REQUIRED';
 
   Future<void> configureCloudSync({required bool enabled, required String apiBaseUrl, required String syncId, required String pin}) async {
-    cloudSyncEnabled = enabled;
+    // Automatic sync is always on once an online sync method is configured.
+    cloudSyncEnabled = true;
     cloudSyncApiBaseUrl = CloudSyncService.resolveApiBaseUrl(apiBaseUrl);
     cloudSyncId = CloudSyncService.normalizeSyncId(syncId);
     cloudSyncPin = pin.trim();
@@ -1595,24 +2281,122 @@ class AppController extends ChangeNotifier {
     await prefs.setBool('cloudSyncEnabled', cloudSyncEnabled);
     await prefs.setString('cloudSyncApiBaseUrl', cloudSyncApiBaseUrl);
     await prefs.setString('cloudSyncId', cloudSyncId);
-    await prefs.setString('cloudSyncPin', cloudSyncPin);
+    await secureCredentials.writeCloudSyncPin(cloudSyncPin);
+    await (await prefs.prefs).remove('cloudSyncPin');
     notifyListeners();
   }
 
-  Future<void> syncToCloud({bool force = false}) async {
+  Future<void> ensureCloudSyncCredentials() async {
+    var changed = false;
+    if (cloudSyncId.trim().isEmpty) {
+      final shortId = _uuid.v4().split('-').first.toLowerCase();
+      cloudSyncId = CloudSyncService.normalizeSyncId('koinly-$shortId');
+      changed = true;
+    }
+    if (cloudSyncPin.trim().isEmpty) {
+      cloudSyncPin = _uuid.v4().replaceAll('-', '').substring(0, 8);
+      changed = true;
+    }
+    if (!changed) return;
+    await prefs.setString('cloudSyncId', cloudSyncId);
+    await secureCredentials.writeCloudSyncPin(cloudSyncPin);
+    await (await prefs.prefs).remove('cloudSyncPin');
+    notifyListeners();
+  }
+
+  Future<void> ensureMongoDbSyncCredentials() async {
+    var changed = false;
+    if (syncMongoSyncId.trim().isEmpty) {
+      final shortId = _uuid.v4().split('-').first.toLowerCase();
+      syncMongoSyncId = CloudSyncService.normalizeSyncId('mongo-$shortId');
+      changed = true;
+    }
+    if (syncMongoSyncPin.trim().isEmpty) {
+      syncMongoSyncPin = _uuid.v4().replaceAll('-', '').substring(0, 8);
+      changed = true;
+    }
+    if (!changed) return;
+    notifyListeners();
+  }
+
+  Future<void> configureSyncDatabase({
+    required SyncDatabaseProvider provider,
+    required String apiBaseUrl,
+    required String mongoDbUrl,
+    required String mongoDatabaseName,
+    required String mongoCollectionName,
+    required String tursoDatabaseUrl,
+    required String tursoAuthToken,
+  }) async {
+    provider = userSyncDatabaseProviders.contains(provider) ? provider : SyncDatabaseProvider.mongoDb;
+    syncDatabaseProvider = provider;
+    cloudSyncApiBaseUrl = CloudSyncService.resolveApiBaseUrl(apiBaseUrl);
+    syncMongoDbUrl = mongoDbUrl.trim();
+    syncMongoDatabaseName = MongoDbSyncService.normalizeDatabaseName(mongoDatabaseName);
+    syncMongoCollectionName = MongoDbSyncService.normalizeCollectionName(mongoCollectionName);
+    syncTursoDatabaseUrl = tursoDatabaseUrl.trim();
+    syncTursoAuthToken = tursoAuthToken.trim();
+    cloudSyncError = null;
+    cloudSyncErrorCode = null;
+    if (provider == SyncDatabaseProvider.local) {
+      cloudSyncEnabled = false;
+      cloudSyncLastAt = null;
+      await prefs.setBool('cloudSyncEnabled', false);
+    } else {
+      cloudSyncEnabled = true;
+      await prefs.setBool('cloudSyncEnabled', true);
+    }
+    await prefs.setEnum('syncDatabaseProvider', provider);
+    await prefs.setString('cloudSyncApiBaseUrl', cloudSyncApiBaseUrl);
+    await prefs.setString('syncMongoDatabaseName', syncMongoDatabaseName);
+    await prefs.setString('syncMongoCollectionName', syncMongoCollectionName);
+    await prefs.setString('syncTursoDatabaseUrl', syncTursoDatabaseUrl);
+    await secureCredentials.writeMongoDbUrl(syncMongoDbUrl);
+    await secureCredentials.writeTursoAuthToken(syncTursoAuthToken);
+    if (cloudSyncPending) _schedulePendingSyncRetry(immediate: true);
+    notifyListeners();
+  }
+
+  Future<void> testSyncDatabaseConnection({
+    SyncDatabaseProvider? provider,
+    String? apiBaseUrl,
+    String? mongoDbUrl,
+    String? mongoDatabaseName,
+    String? mongoCollectionName,
+  }) async {
+    final resolvedProvider = provider ?? syncDatabaseProvider;
+    switch (resolvedProvider) {
+      case SyncDatabaseProvider.local:
+        return;
+      case SyncDatabaseProvider.turso:
+      case SyncDatabaseProvider.cloudflareD1:
+      case SyncDatabaseProvider.supabase:
+      case SyncDatabaseProvider.neonPostgres:
+      case SyncDatabaseProvider.firebaseFirestore:
+        await CloudSyncService.testBackend(apiBaseUrl ?? cloudSyncApiBaseUrl);
+        return;
+      case SyncDatabaseProvider.mongoDb:
+        await MongoDbSyncService.testConnection(
+          connectionString: mongoDbUrl ?? syncMongoDbUrl,
+          databaseName: mongoDatabaseName ?? syncMongoDatabaseName,
+          collectionName: mongoCollectionName ?? syncMongoCollectionName,
+        );
+        return;
+    }
+  }
+
+  Future<void> syncMainOnlineToCloud({bool force = false}) async {
     if (cloudSyncBusy) return;
-    if (!force && !cloudSyncEnabled) return;
     if (cloudSyncId.trim().isEmpty || cloudSyncPin.trim().isEmpty) {
-      cloudSyncError = 'Add a Sync ID and PIN first.';
-      notifyListeners();
-      return;
+      await ensureCloudSyncCredentials();
     }
     cloudSyncBusy = true;
     cloudSyncError = null;
     cloudSyncErrorCode = null;
     notifyListeners();
     try {
-      await CloudSyncService.upload(apiBaseUrl: cloudSyncApiBaseUrl, syncId: cloudSyncId, pin: cloudSyncPin, payload: await exportCloudPayload());
+      final payload = await exportCloudPayload();
+      await CloudSyncService.upload(apiBaseUrl: cloudSyncApiBaseUrl, syncId: cloudSyncId, pin: cloudSyncPin, payload: payload);
       cloudSyncLastAt = DateTime.now();
       await prefs.setString('cloudSyncLastAt', cloudSyncLastAt!.toIso8601String());
     } catch (error) {
@@ -1624,10 +2408,10 @@ class AppController extends ChangeNotifier {
     }
   }
 
-  Future<void> syncFromCloud() async {
+  Future<void> syncMainOnlineFromCloud() async {
     if (cloudSyncBusy) return;
     if (cloudSyncId.trim().isEmpty || cloudSyncPin.trim().isEmpty) {
-      cloudSyncError = 'Add a Sync ID and PIN first.';
+      cloudSyncError = 'Enter a Sync ID and PIN on the main Online data sync page, or upload first to create them.';
       notifyListeners();
       return;
     }
@@ -1645,7 +2429,8 @@ class AppController extends ChangeNotifier {
       await prefs.setBool('cloudSyncEnabled', true);
       await prefs.setString('cloudSyncApiBaseUrl', cloudSyncApiBaseUrl);
       await prefs.setString('cloudSyncId', cloudSyncId);
-      await prefs.setString('cloudSyncPin', cloudSyncPin);
+      await secureCredentials.writeCloudSyncPin(cloudSyncPin);
+      await (await prefs.prefs).remove('cloudSyncPin');
       cloudSyncLastAt = DateTime.now();
       await prefs.setString('cloudSyncLastAt', cloudSyncLastAt!.toIso8601String());
       await reload(queueSync: false);
@@ -1658,22 +2443,172 @@ class AppController extends ChangeNotifier {
     }
   }
 
+  Future<void> syncToCloud({bool force = false, bool silent = false}) async {
+    if (cloudSyncBusy) return;
+    if (!_hasConfiguredSyncTarget()) return;
+    if (syncDatabaseProvider != SyncDatabaseProvider.mongoDb && (cloudSyncId.trim().isEmpty || cloudSyncPin.trim().isEmpty)) {
+      await ensureCloudSyncCredentials();
+    }
+    cloudSyncBusy = true;
+    if (!silent) {
+      cloudSyncError = null;
+      cloudSyncErrorCode = null;
+    }
+    notifyListeners();
+    try {
+      final payload = await exportCloudPayload();
+      switch (syncDatabaseProvider) {
+        case SyncDatabaseProvider.local:
+          break;
+        case SyncDatabaseProvider.turso:
+        case SyncDatabaseProvider.cloudflareD1:
+        case SyncDatabaseProvider.supabase:
+        case SyncDatabaseProvider.neonPostgres:
+        case SyncDatabaseProvider.firebaseFirestore:
+          await CloudSyncService.upload(apiBaseUrl: cloudSyncApiBaseUrl, syncId: cloudSyncId, pin: cloudSyncPin, payload: payload);
+          break;
+        case SyncDatabaseProvider.mongoDb:
+          await MongoDbSyncService.upload(
+            connectionString: syncMongoDbUrl,
+            databaseName: syncMongoDatabaseName,
+            collectionName: syncMongoCollectionName,
+            payload: payload,
+          );
+          break;
+      }
+      cloudSyncLastAt = DateTime.now();
+      await prefs.setString('cloudSyncLastAt', cloudSyncLastAt!.toIso8601String());
+      await _setCloudSyncPending(false);
+      cloudSyncError = null;
+      cloudSyncErrorCode = null;
+      _cloudSyncRetryTimer?.cancel();
+      _cloudSyncRetryTimer = null;
+    } catch (error) {
+      await _setCloudSyncPending(true);
+      _schedulePendingSyncRetry();
+      if (!silent) {
+        cloudSyncError = _cleanSyncError(error);
+        cloudSyncErrorCode = error is CloudSyncException ? error.code : null;
+      } else {
+        cloudSyncError = null;
+        cloudSyncErrorCode = null;
+      }
+    } finally {
+      cloudSyncBusy = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> syncFromCloud() async {
+    if (cloudSyncBusy) return;
+    if (syncDatabaseProvider == SyncDatabaseProvider.local) {
+      cloudSyncError = 'Local Database mode is enabled. Choose an online database method to download cloud data.';
+      notifyListeners();
+      return;
+    }
+    if (syncDatabaseProvider != SyncDatabaseProvider.mongoDb && (cloudSyncId.trim().isEmpty || cloudSyncPin.trim().isEmpty)) {
+      cloudSyncError = 'Upload local data first to create a Sync ID and PIN, or enter an existing Sync ID and PIN.';
+      notifyListeners();
+      return;
+    }
+    cloudSyncBusy = true;
+    cloudSyncError = null;
+    cloudSyncErrorCode = null;
+    notifyListeners();
+    try {
+      late final Map<String, dynamic> payload;
+      switch (syncDatabaseProvider) {
+        case SyncDatabaseProvider.local:
+          payload = <String, dynamic>{};
+          break;
+        case SyncDatabaseProvider.turso:
+        case SyncDatabaseProvider.cloudflareD1:
+        case SyncDatabaseProvider.supabase:
+        case SyncDatabaseProvider.neonPostgres:
+        case SyncDatabaseProvider.firebaseFirestore:
+          payload = await CloudSyncService.download(apiBaseUrl: cloudSyncApiBaseUrl, syncId: cloudSyncId, pin: cloudSyncPin);
+          break;
+        case SyncDatabaseProvider.mongoDb:
+          payload = await MongoDbSyncService.download(
+            connectionString: syncMongoDbUrl,
+            databaseName: syncMongoDatabaseName,
+            collectionName: syncMongoCollectionName,
+          );
+          break;
+      }
+      final databasePayload = (payload['database'] as Map? ?? {}).cast<String, dynamic>();
+      final preferencesPayload = (payload['preferences'] as Map? ?? {}).cast<String, dynamic>();
+      await database.importAll(databasePayload);
+      await importPreferences(preferencesPayload);
+      cloudSyncEnabled = true;
+      await prefs.setBool('cloudSyncEnabled', true);
+      await prefs.setEnum('syncDatabaseProvider', syncDatabaseProvider);
+      await prefs.setString('cloudSyncApiBaseUrl', cloudSyncApiBaseUrl);
+      if (syncDatabaseProvider != SyncDatabaseProvider.mongoDb) {
+        await prefs.setString('cloudSyncId', cloudSyncId);
+        await secureCredentials.writeCloudSyncPin(cloudSyncPin);
+        await (await prefs.prefs).remove('cloudSyncPin');
+      }
+      cloudSyncLastAt = DateTime.now();
+      await prefs.setString('cloudSyncLastAt', cloudSyncLastAt!.toIso8601String());
+      await reload(queueSync: false);
+    } catch (error) {
+      cloudSyncError = _cleanSyncError(error);
+      cloudSyncErrorCode = error is CloudSyncException ? error.code : null;
+    } finally {
+      cloudSyncBusy = false;
+      notifyListeners();
+    }
+  }
+
+  bool _hasConfiguredSyncTarget() {
+    if (syncDatabaseProvider == SyncDatabaseProvider.local) return false;
+    if (syncDatabaseProvider == SyncDatabaseProvider.mongoDb) return syncMongoDbUrl.trim().isNotEmpty;
+    return cloudSyncApiBaseUrl.trim().isNotEmpty;
+  }
+
+  Future<void> _setCloudSyncPending(bool value) async {
+    cloudSyncPending = value;
+    await prefs.setBool('cloudSyncPending', value);
+  }
+
+  void _schedulePendingSyncRetry({bool immediate = false}) {
+    if (!_hasConfiguredSyncTarget()) return;
+    if (immediate && cloudSyncPending && !cloudSyncBusy) {
+      unawaited(syncToCloud(silent: true));
+    }
+    _cloudSyncRetryTimer ??= Timer.periodic(const Duration(seconds: 30), (_) {
+      if (!cloudSyncPending) {
+        _cloudSyncRetryTimer?.cancel();
+        _cloudSyncRetryTimer = null;
+        return;
+      }
+      if (!cloudSyncBusy && _hasConfiguredSyncTarget()) {
+        unawaited(syncToCloud(silent: true));
+      }
+    });
+  }
+
   void queueCloudSync() {
-    if (!cloudSyncEnabled || cloudSyncId.trim().isEmpty || cloudSyncPin.trim().isEmpty) return;
+    if (!_hasConfiguredSyncTarget()) return;
+    unawaited(_setCloudSyncPending(true));
+    _schedulePendingSyncRetry();
     _cloudSyncDebounce?.cancel();
     _cloudSyncDebounce = Timer(const Duration(seconds: 3), () {
-      unawaited(syncToCloud());
+      unawaited(syncToCloud(silent: true));
     });
   }
 
   String _cleanSyncError(Object error) {
     final text = error.toString().replaceFirst('Exception: ', '').replaceFirst('Bad state: ', '').trim();
-    return text.isEmpty ? 'Sync failed. Check your internet and Turso setup.' : text;
+    final redacted = redactSyncSecrets(text);
+    return redacted.isEmpty ? 'Sync failed. Check your database configuration.' : redacted;
   }
 
   @override
   void dispose() {
     _cloudSyncDebounce?.cancel();
+    _cloudSyncRetryTimer?.cancel();
     super.dispose();
   }
 
@@ -1683,7 +2618,8 @@ class AppController extends ChangeNotifier {
     transactions = await database.transactions();
     budgets = await database.budgets();
     loans = await database.loans();
-    defaultAccountId ??= accounts.isNotEmpty ? accounts.first.id : null;
+    loanRepaymentReminders = await database.loanRepaymentReminders();
+    defaultAccountId ??= accounts.where((a) => a.type != AccountType.savings).firstOrNull?.id ?? accounts.firstOrNull?.id;
     defaultExpenseCategoryId ??= categories.where((c) => c.type == CategoryType.expense && !c.isLoanSystemCategory).firstOrNull?.id;
     defaultIncomeCategoryId ??= categories.where((c) => c.type == CategoryType.income && !c.isLoanSystemCategory).firstOrNull?.id;
     notifyListeners();
@@ -1719,20 +2655,108 @@ class AppController extends ChangeNotifier {
 
   Future<void> completeOnboarding() async {
     onboardingCompleted = true;
+    if (kIsDesktopApp) {
+      desktopSetupVersionCompleted = kRequiredDesktopSetupVersion;
+    }
     await prefs.setBool('onboardingCompleted', true);
+    if (kIsDesktopApp) {
+      await prefs.setInt('desktopSetupVersionCompleted', desktopSetupVersionCompleted);
+    }
     notifyListeners();
   }
 
   Account? accountOf(String id) => accounts.where((a) => a.id == id).firstOrNull;
   Category? categoryOf(String id) => categories.where((c) => c.id == id).firstOrNull;
+  Loan? loanOf(String id) => loans.where((l) => l.id == id).firstOrNull;
+  List<LoanRepaymentReminder> loanRemindersFor(String loanId) => loanRepaymentReminders.where((r) => r.loanId == loanId).toList();
+  List<LoanRepaymentReminder> get overdueLoanReminders => loanRepaymentReminders.where((r) => r.isOverdue).toList();
+  List<LoanRepaymentReminder> get dueTodayLoanReminders => loanRepaymentReminders.where((r) => r.isDueToday).toList();
+
+  List<Account> get operatingAccounts => accounts.where((a) => a.type != AccountType.savings).toList();
+  List<Account> get savingAccounts => accounts.where((a) => a.type == AccountType.savings).toList();
+  double get operatingAccountBalance => operatingAccounts.fold<double>(0, (sum, account) => sum + account.amount);
+  double get savingAccountBalance => savingAccounts.fold<double>(0, (sum, account) => sum + account.amount);
 
   double get totalAccountBalance => accounts.fold<double>(0, (sum, account) => sum + account.amount);
 
   String format(double amount) {
+    if (amountsHidden) {
+      return currencyPosition == CurrencyPosition.prefix ? '$currencySymbol••••' : '••••$currencySymbol';
+    }
     final formatter = NumberFormat(useSeparators ? '#,##0.##' : '0.##');
     final num = formatter.format(amount.abs());
     final sign = amount < 0 ? '-' : '';
     return currencyPosition == CurrencyPosition.prefix ? '$sign$currencySymbol$num' : '$sign$num$currencySymbol';
+  }
+
+  Future<void> toggleAmountsHidden() async {
+    amountsHidden = !amountsHidden;
+    await prefs.setBool('amountsHidden', amountsHidden);
+    notifyListeners();
+  }
+
+  List<SavingsPurchaseSuggestion> savingsPurchaseSuggestions() => buildSavingsPurchaseSuggestions(this);
+
+  List<SavingsPurchaseSuggestion> unseenSavingsPurchaseSuggestionsForToday() {
+    final today = savingsSuggestionDayKey();
+    final visibleKeys = seenSavingsSuggestionKeys.where((key) => key.startsWith('$today::')).toSet();
+    return savingsPurchaseSuggestions().where((suggestion) => !visibleKeys.contains(savingsSuggestionSeenKey(suggestion.id))).toList();
+  }
+
+  Future<void> markSavingsSuggestionSeenToday(String id) async {
+    final today = savingsSuggestionDayKey();
+    final recentKeys = seenSavingsSuggestionKeys.where((key) {
+      final parts = key.split('::');
+      if (parts.length != 2) return false;
+      final date = DateTime.tryParse(parts.first);
+      if (date == null) return false;
+      return DateTime.now().difference(date).inDays <= 14;
+    }).toList();
+    final key = savingsSuggestionSeenKey(id);
+    if (!recentKeys.contains(key)) recentKeys.add(key);
+    seenSavingsSuggestionKeys = recentKeys;
+    await prefs.setStringList('seenSavingsSuggestionKeys', seenSavingsSuggestionKeys);
+    notifyListeners();
+  }
+
+  Future<void> dismissFinancialHealthSummary(String key) async {
+    if (!dismissedFinancialHealthSummaryKeys.contains(key)) {
+      dismissedFinancialHealthSummaryKeys = [...dismissedFinancialHealthSummaryKeys, key];
+      await prefs.setStringList('dismissedFinancialHealthSummaryKeys', dismissedFinancialHealthSummaryKeys);
+      notifyListeners();
+    }
+  }
+
+  Future<void> dismissFinancialHealthSummaries(Iterable<String> keys) async {
+    final merged = {...dismissedFinancialHealthSummaryKeys, ...keys}.toList();
+    dismissedFinancialHealthSummaryKeys = merged;
+    await prefs.setStringList('dismissedFinancialHealthSummaryKeys', dismissedFinancialHealthSummaryKeys);
+    notifyListeners();
+  }
+
+  Future<void> saveSavingsSuggestionProfile(SavingsSuggestionProfile profile) async {
+    savingsSuggestionProfile = profile.copyWith(completed: true, updatedOn: DateTime.now());
+    await prefs.setString('savingsSuggestionProfile', jsonEncode(savingsSuggestionProfile.toJson()));
+    notifyListeners();
+    queueCloudSync();
+  }
+
+  Future<void> saveSavingsIdea(String id) async {
+    if (!savedSavingsIdeas.contains(id)) {
+      savedSavingsIdeas = [...savedSavingsIdeas, id];
+      await prefs.setStringList('savedSavingsIdeas', savedSavingsIdeas);
+      notifyListeners();
+      queueCloudSync();
+    }
+  }
+
+  Future<void> markSavingsIdeaPlanned(String id) async {
+    if (!plannedSavingsIdeas.contains(id)) {
+      plannedSavingsIdeas = [...plannedSavingsIdeas, id];
+      await prefs.setStringList('plannedSavingsIdeas', plannedSavingsIdeas);
+      notifyListeners();
+      queueCloudSync();
+    }
   }
 
   DateRange activeRange() {
@@ -1765,9 +2789,10 @@ class AppController extends ChangeNotifier {
         if (range.end != null && !tx.createdOn.isBefore(range.end!)) return false;
       }
       if (filterAccountIds.isNotEmpty && !filterAccountIds.contains(tx.fromAccountId) && !(tx.toAccountId != null && filterAccountIds.contains(tx.toAccountId))) return false;
-      if (filterCategoryIds.isNotEmpty && !filterCategoryIds.contains(tx.categoryId)) return false;
+      final isReportableCategoryTransaction = tx.countsAsIncome || tx.countsAsExpense;
+      if (filterCategoryIds.isNotEmpty && (!isReportableCategoryTransaction || !filterCategoryIds.contains(tx.categoryId))) return false;
       if (filterTypes.isNotEmpty && (tx.isLoanMovement || !filterTypes.contains(tx.type))) return false;
-      if (categoryId != null && tx.categoryId != categoryId) return false;
+      if (categoryId != null && (!isReportableCategoryTransaction || tx.categoryId != categoryId)) return false;
       if (accountId != null && tx.fromAccountId != accountId && tx.toAccountId != accountId) return false;
       if (types != null && (tx.isLoanMovement || !types.contains(tx.type))) return false;
       return true;
@@ -1908,18 +2933,278 @@ class AppController extends ChangeNotifier {
   Future<void> deleteBudget(String id) async { await database.deleteBudget(id); await reload(queueSync: true); }
   Future<void> addLoan(Loan loan) async { await database.addLoan(loan); await reload(queueSync: true); }
   Future<void> updateLoan(Loan loan) async { await database.updateLoan(loan); await reload(queueSync: true); }
-  Future<void> deleteLoan(String id) async { await database.deleteLoan(id); await reload(queueSync: true); }
+  Future<void> deleteLoan(String id) async {
+    for (final reminder in loanRemindersFor(id)) {
+      await ReminderService.cancelLoanRepaymentReminder(reminder.id);
+    }
+    await database.deleteLoan(id);
+    await reload(queueSync: true);
+  }
   Future<void> addRepayment(Loan loan, LoanRepayment repayment, String accountId) async { await database.addRepayment(loan, repayment, accountId); await reload(queueSync: true); }
   Future<void> deleteRepayment(String id) async { await database.deleteRepayment(id); await reload(queueSync: true); }
+
+  Future<void> replaceLoanRepaymentReminders(String loanId, List<LoanRepaymentReminder> reminders) async {
+    for (final oldReminder in loanRemindersFor(loanId).where((r) => !r.isPaid)) {
+      await ReminderService.cancelLoanRepaymentReminder(oldReminder.id);
+    }
+    await database.replacePendingLoanRepaymentReminders(loanId, reminders);
+    final loan = loanOf(loanId);
+    if (loan != null) {
+      for (final reminder in reminders) {
+        await ReminderService.scheduleLoanRepaymentReminder(loan: loan, reminder: reminder);
+      }
+    }
+    await reload(queueSync: true);
+  }
+
+  Future<void> deleteLoanRepaymentReminder(String id) async {
+    await ReminderService.cancelLoanRepaymentReminder(id);
+    await database.deleteLoanRepaymentReminder(id);
+    await reload(queueSync: true);
+  }
+
+  Future<void> markLoanRepaymentReminderPaid(Loan loan, LoanRepaymentReminder reminder, String accountId) async {
+    await database.markLoanRepaymentReminderPaid(loan, reminder, accountId);
+    await ReminderService.cancelLoanRepaymentReminder(reminder.id);
+    await reload(queueSync: true);
+  }
 }
 
 extension FirstOrNullExtension<T> on Iterable<T> {
   T? get firstOrNull => isEmpty ? null : first;
 }
 
+
+String savingsSuggestionDayKey([DateTime? date]) {
+  final value = date ?? DateTime.now();
+  return DateFormat('yyyy-MM-dd').format(value);
+}
+
+String savingsSuggestionSeenKey(String id, [DateTime? date]) => '${savingsSuggestionDayKey(date)}::$id';
+
+const int kDailySavingsSuggestionLimit = 10;
+
+List<SavingsPurchaseSuggestion> buildSavingsPurchaseSuggestions(AppController state) {
+  final profile = state.savingsSuggestionProfile;
+  final balance = state.savingAccountBalance;
+  String range(double lowFactor, double highFactor, {double min = 300, double max = 50000}) {
+    final low = balance <= 0 ? min : math.max(min, math.min(max, balance * lowFactor));
+    final high = balance <= 0 ? math.max(min * 2, 1000) : math.max(low, math.min(max, balance * highFactor));
+    return '${state.format(low.toDouble())} – ${state.format(high.toDouble())}';
+  }
+
+  final text = [profile.hobby, profile.occupation, profile.savingsGoal, profile.spendingPreference, profile.extraDetails]
+      .join(' ')
+      .toLowerCase();
+  final suggestions = <SavingsPurchaseSuggestion>[];
+
+  void add(String id, String title, String costRange, String reason, String savingsFit, String iconName, String color) {
+    if (suggestions.any((s) => s.id == id)) return;
+    suggestions.add(SavingsPurchaseSuggestion(id: id, title: title, costRange: costRange, reason: reason, savingsFit: savingsFit, iconName: iconName, color: color));
+  }
+
+  if (balance <= 0) {
+    add('start-savings-buffer', 'Start a savings buffer', state.format(500), 'Your savings account is empty, so the safest first idea is building a small buffer before buying anything.', 'A low target helps you start without creating pressure.', 'savings', '#A6E3A1');
+  }
+  if (text.contains('student') || text.contains('study') || text.contains('school') || text.contains('college') || text.contains('university')) {
+    add('student-study-kit', 'Study upgrade kit', range(.08, .18, min: 500, max: 8000), 'Useful for a student profile: notebooks, stationery, flash drive, or a focused study accessory.', 'Keep this below a small part of your savings so the account still grows.', 'book', '#78D8E8');
+    add('course-or-exam', 'Course or exam prep', range(.12, .28, min: 800, max: 15000), 'A skill course or exam prep material can support your education instead of becoming a short-term impulse buy.', 'Best when it helps your current savings goal.', 'school', '#B4A5FF');
+  }
+  if (text.contains('game') || text.contains('gaming') || text.contains('gamer')) {
+    add('gaming-accessory', 'Gaming accessory', range(.10, .22, min: 1000, max: 18000), 'Your profile mentions gaming, so a controller, headset, or mouse can be a relevant planned purchase.', 'Choose this only if it does not reduce your main savings goal too much.', 'sports_esports', '#FBC879');
+    add('gaming-audio', 'Gaming audio upgrade', range(.08, .18, min: 900, max: 12000), 'A headset or speakers can improve long gaming sessions more than random impulse spending.', 'Keep hobby spending within a fixed limit.', 'headphones', '#B4A5FF');
+  }
+  if (text.contains('anime') || text.contains('manga') || text.contains('otaku')) {
+    add('anime-manga-fund', 'Anime or manga fund', range(.06, .18, min: 500, max: 12000), 'A small hobby fund can help you buy manga, merch, or event tickets without touching core savings.', 'Set a fixed cap so the hobby remains controlled.', 'origami_bird', '#FF6BAA');
+    add('manga-box-set', 'Manga box set or volume bundle', range(.10, .24, min: 900, max: 15000), 'If you enjoy manga, a planned volume bundle is usually better than scattered impulse purchases.', 'Choose a title you already planned to collect.', 'manga', '#F472B6');
+    add('anime-collectible', 'Anime collectible or display item', range(.08, .20, min: 800, max: 14000), 'A controlled collectible budget can fit anime fans without draining your savings goal.', 'Only buy if it fits after essentials and your target savings.', 'collectibles', '#FB7185');
+  }
+  if (text.contains('creator') || text.contains('youtube') || text.contains('video') || text.contains('content') || text.contains('stream')) {
+    add('creator-gear', 'Creator gear upgrade', range(.14, .32, min: 1500, max: 25000), 'A mic, tripod, light, or storage upgrade fits a content-creator profile and can improve output quality.', 'Prefer gear that solves a real workflow problem.', 'camera_alt', '#86E3CE');
+    add('creator-audio', 'Microphone or audio accessory', range(.10, .22, min: 1200, max: 16000), 'Clearer audio can be one of the best-value upgrades for content creation.', 'Buy it only if it improves your current setup.', 'mic', '#78D8E8');
+  }
+  if (text.contains('read') || text.contains('book') || text.contains('novel')) {
+    add('reader-stack', 'Book stack', range(.05, .14, min: 400, max: 8000), 'A planned book purchase fits your reading interest while keeping the amount modest.', 'Buy from a wishlist instead of impulse browsing.', 'book', '#FBC879');
+  }
+  if (text.contains('travel') || text.contains('trip')) {
+    add('travel-day-plan', 'Small travel plan', range(.15, .35, min: 1500, max: 30000), 'Your profile suggests travel, so a controlled day-trip fund may fit better than random spending.', 'Keep transport, food, and emergency money inside the estimate.', 'flight', '#78D8E8');
+  }
+  if (text.contains('work') || text.contains('job') || text.contains('office') || text.contains('freelance')) {
+    add('work-productivity', 'Work productivity item', range(.08, .22, min: 800, max: 16000), 'A practical desk, bag, keyboard, or app subscription can support your work routine.', 'Use this only if it improves daily productivity.', 'work', '#A6E3A1');
+  }
+
+  add('safe-buffer', 'Emergency buffer first', balance <= 0 ? state.format(1000) : range(.20, .45, min: 1000, max: 50000), 'Before optional purchases, keeping a reserve protects your savings from sudden needs.', 'This is the safest option if your savings goal is important.', 'health', '#A6E3A1');
+  add('skill-investment', 'Skill investment', balance <= 0 ? state.format(800) : range(.08, .20, min: 800, max: 18000), 'A course, book, or tool that improves your skills can be more useful than a quick purchase.', 'Choose it when it matches your occupation or goal.', 'school', '#B4A5FF');
+  add('wishlist-item', 'Planned wishlist item', balance <= 0 ? state.format(500) : range(.05, .15, min: 500, max: 12000), 'A small planned item can be reasonable if it stays within your savings limit.', 'Avoid buying it if it delays a higher-priority goal.', 'gift', '#FFB5D0');
+  add('audio-upgrade', 'Headphones or earphones', balance <= 0 ? state.format(700) : range(.06, .18, min: 700, max: 10000), 'Audio gear can be a practical upgrade for study, work, or entertainment when chosen carefully.', 'Keep it in a comfortable range that does not hurt your goal.', 'headphones', '#89A7FF');
+  add('digital-subscription', 'Useful subscription or membership', balance <= 0 ? state.format(300) : range(.03, .10, min: 300, max: 5000), 'A single useful subscription can be more valuable than multiple impulse purchases.', 'Only continue it if you actually use it regularly.', 'subscription', '#86E3CE');
+  add('creative-hobby', 'Creative hobby supplies', balance <= 0 ? state.format(400) : range(.05, .14, min: 400, max: 8000), 'Art, journaling, or other hobby supplies can be a controlled way to enjoy your savings.', 'Set a spending ceiling before buying.', 'art', '#FBC879');
+  add('small-tech-upgrade', 'Small tech or desk upgrade', balance <= 0 ? state.format(900) : range(.08, .20, min: 900, max: 18000), 'A keyboard, stand, or small device can improve daily comfort if it solves a real need.', 'Choose practical upgrades over impulse gadgets.', 'keyboard', '#78D8E8');
+  add('essential-replacement', 'Essential replacement fund', balance <= 0 ? state.format(600) : range(.05, .16, min: 600, max: 12000), 'Set aside money for replacing something useful before it becomes urgent.', 'This keeps savings practical instead of only entertainment-focused.', 'tools', '#A6E3A1');
+  add('health-comfort-item', 'Health or comfort item', balance <= 0 ? state.format(500) : range(.04, .14, min: 500, max: 10000), 'A planned health, comfort, or daily-use item can be reasonable when it improves routine life.', 'Keep it below your main savings target.', 'health', '#86E3CE');
+  add('home-organizer', 'Home organizer or storage', balance <= 0 ? state.format(500) : range(.04, .13, min: 500, max: 9000), 'Small home organization purchases can reduce clutter without becoming a large expense.', 'Choose only one useful item and avoid extra add-ons.', 'home', '#FBC879');
+  add('small-gift-plan', 'Small gift plan', balance <= 0 ? state.format(400) : range(.04, .12, min: 400, max: 8000), 'Planning a gift ahead of time prevents last-minute overspending.', 'Use a fixed cap so generosity does not break the budget.', 'gift', '#FFB5D0');
+  add('do-not-buy-yet', 'Wait and compare prices', state.format(0), 'Sometimes the best suggestion is not buying now. Compare prices and wait if the item is not needed.', 'This keeps your savings intact.', 'schedule', '#9AD0F5');
+
+  if (suggestions.length <= kDailySavingsSuggestionLimit) return suggestions;
+  final now = DateTime.now();
+  final daySeed = DateTime(now.year, now.month, now.day).difference(DateTime(now.year, 1, 1)).inDays;
+  final start = daySeed % suggestions.length;
+  return List<SavingsPurchaseSuggestion>.generate(kDailySavingsSuggestionLimit, (i) => suggestions[(start + i) % suggestions.length]);
+}
+
 // -----------------------------------------------------------------------------
 // App shell and shared UI
 // -----------------------------------------------------------------------------
+
+
+class AppBreakpoints {
+  const AppBreakpoints._();
+
+  static const double compact = 360;
+  static const double medium = 600;
+  static const double expanded = 900;
+  static const double large = 1180;
+
+  static bool isSmall(BuildContext context) => MediaQuery.sizeOf(context).width < compact;
+  static bool isMedium(BuildContext context) => MediaQuery.sizeOf(context).width >= medium;
+  static bool isExpanded(BuildContext context) => MediaQuery.sizeOf(context).width >= expanded;
+  static bool isLarge(BuildContext context) => MediaQuery.sizeOf(context).width >= large;
+}
+
+class AppMotion {
+  const AppMotion._();
+
+  static const Duration fast = Duration(milliseconds: 150);
+  static const Duration medium = Duration(milliseconds: 260);
+  static const Duration slow = Duration(milliseconds: 420);
+
+  static const Curve standard = Cubic(0.2, 0.0, 0.0, 1.0);
+  static const Curve emphasized = Cubic(0.05, 0.7, 0.1, 1.0);
+  static const Curve emphasizedAccelerate = Cubic(0.3, 0.0, 0.8, 0.15);
+  static const Curve spring = Curves.easeOutBack;
+}
+
+class AppShapes {
+  const AppShapes._();
+
+  static BorderRadius extraSmall = BorderRadius.circular(12);
+  static BorderRadius small = BorderRadius.circular(16);
+  static BorderRadius medium = BorderRadius.circular(20);
+  static BorderRadius large = BorderRadius.circular(24);
+  static BorderRadius extraLarge = BorderRadius.circular(30);
+  static BorderRadius dialog = BorderRadius.circular(32);
+  static BorderRadius full = BorderRadius.circular(999);
+
+  static RoundedRectangleBorder squircle(double radius) => RoundedRectangleBorder(borderRadius: BorderRadius.circular(radius));
+}
+
+class KoinlyPageTransitionsBuilder extends PageTransitionsBuilder {
+  const KoinlyPageTransitionsBuilder();
+
+  @override
+  Widget buildTransitions<T>(
+    PageRoute<T> route,
+    BuildContext context,
+    Animation<double> animation,
+    Animation<double> secondaryAnimation,
+    Widget child,
+  ) {
+    if (route.isFirst) return child;
+    final fade = CurvedAnimation(parent: animation, curve: AppMotion.emphasized, reverseCurve: AppMotion.emphasizedAccelerate);
+    final slide = Tween<Offset>(begin: const Offset(0.035, 0), end: Offset.zero).animate(fade);
+    final scale = Tween<double>(begin: .985, end: 1).animate(fade);
+    return FadeTransition(
+      opacity: fade,
+      child: SlideTransition(
+        position: slide,
+        child: ScaleTransition(scale: scale, child: child),
+      ),
+    );
+  }
+}
+
+class MotionPressable extends StatefulWidget {
+  const MotionPressable({
+    super.key,
+    required this.child,
+    this.onTap,
+    this.borderRadius,
+    this.scale = .975,
+  });
+
+  final Widget child;
+  final VoidCallback? onTap;
+  final BorderRadius? borderRadius;
+  final double scale;
+
+  @override
+  State<MotionPressable> createState() => _MotionPressableState();
+}
+
+class _MotionPressableState extends State<MotionPressable> {
+  bool _pressed = false;
+
+  void _setPressed(bool value) {
+    if (_pressed == value || !mounted) return;
+    setState(() => _pressed = value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = widget.borderRadius ?? AppShapes.large;
+    return MouseRegion(
+      cursor: widget.onTap == null ? SystemMouseCursors.basic : SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTapDown: widget.onTap == null ? null : (_) => _setPressed(true),
+        onTapCancel: widget.onTap == null ? null : () => _setPressed(false),
+        onTapUp: widget.onTap == null ? null : (_) => _setPressed(false),
+        onTap: widget.onTap,
+        child: AnimatedScale(
+          duration: AppMotion.fast,
+          curve: _pressed ? Curves.easeOutCubic : AppMotion.spring,
+          scale: _pressed ? widget.scale : 1,
+          child: ClipRRect(borderRadius: radius, child: widget.child),
+        ),
+      ),
+    );
+  }
+}
+
+class KoinlyScrollBehavior extends MaterialScrollBehavior {
+  const KoinlyScrollBehavior();
+
+  @override
+  Set<ui.PointerDeviceKind> get dragDevices => const {
+        ui.PointerDeviceKind.touch,
+        ui.PointerDeviceKind.mouse,
+        ui.PointerDeviceKind.trackpad,
+        ui.PointerDeviceKind.stylus,
+        ui.PointerDeviceKind.unknown,
+      };
+
+  @override
+  ScrollPhysics getScrollPhysics(BuildContext context) {
+    if (kIsDesktopApp) return const ClampingScrollPhysics();
+    return const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics());
+  }
+
+  @override
+  Widget buildScrollbar(BuildContext context, Widget child, ScrollableDetails details) {
+    if (!kIsDesktopApp) return child;
+    return Scrollbar(
+      controller: details.controller,
+      interactive: true,
+      child: child,
+    );
+  }
+}
+
+ScrollPhysics optimizedScrollPhysics(BuildContext context) {
+  if (kIsDesktopApp) return const ClampingScrollPhysics();
+  return const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics());
+}
 
 class KoinlyApp extends StatelessWidget {
   const KoinlyApp({super.key});
@@ -1929,122 +3214,268 @@ class KoinlyApp extends StatelessWidget {
     final state = context.watch<AppController>();
     return MaterialApp(
       debugShowCheckedModeBanner: false,
+      scrollBehavior: const KoinlyScrollBehavior(),
       title: appTitle,
       themeMode: state.themeMode,
       theme: _theme(Brightness.light),
       darkTheme: _theme(Brightness.dark),
       home: const StartupGate(),
+      builder: (context, child) {
+        final media = MediaQuery.of(context);
+        final width = media.size.width;
+        final maxScale = width < 360 ? 1.04 : width < 600 ? 1.14 : width < 900 ? 1.22 : 1.30;
+        return MediaQuery(
+          data: media.copyWith(textScaler: media.textScaler.clamp(minScaleFactor: .90, maxScaleFactor: maxScale)),
+          child: child ?? const SizedBox.shrink(),
+        );
+      },
     );
   }
 
   ThemeData _theme(Brightness brightness) {
     final isDark = brightness == Brightness.dark;
-    final scheme = ColorScheme.fromSeed(
+    final baseScheme = ColorScheme.fromSeed(
       seedColor: kSleekAccent,
       brightness: brightness,
     );
-    final darkScheme = scheme.copyWith(
-      primary: kSleekAccent,
-      secondary: const Color(0xFF2BD9A1),
-      tertiary: const Color(0xFFFF5C7A),
-      surface: kSleekSurface,
-      surfaceContainerHighest: kSleekSurfaceHigh,
-      background: kSleekBackground,
-      outline: const Color(0xFF2A3940),
-      outlineVariant: const Color(0xFF1D2A30),
-    );
+    final scheme = isDark
+        ? baseScheme.copyWith(
+            primary: kSleekAccent,
+            onPrimary: const Color(0xFF002022),
+            secondary: const Color(0xFF2BD9A1),
+            tertiary: const Color(0xFFFF5C7A),
+            surface: kSleekSurface,
+            surfaceContainerLow: const Color(0xFF0B1619),
+            surfaceContainer: const Color(0xFF101B1F),
+            surfaceContainerHigh: kSleekSurfaceHigh,
+            surfaceContainerHighest: kSleekSurfaceHigher,
+            background: kSleekBackground,
+            outline: const Color(0xFF2A3940),
+            outlineVariant: const Color(0xFF1D2A30),
+          )
+        : baseScheme.copyWith(
+            primary: kSleekAccent,
+            onPrimary: const Color(0xFF002022),
+            secondary: const Color(0xFF00A879),
+            tertiary: const Color(0xFFFF5074),
+            surface: Colors.white,
+            surfaceContainerLow: const Color(0xFFF8FDFF),
+            surfaceContainer: const Color(0xFFF2F9FB),
+            surfaceContainerHigh: const Color(0xFFEAF4F7),
+            surfaceContainerHighest: const Color(0xFFE0EEF2),
+            background: const Color(0xFFF5FAFB),
+            outline: const Color(0xFFB9C9CF),
+            outlineVariant: const Color(0xFFD8E6EA),
+          );
+
+    final textTheme = Typography.material2021(platform: TargetPlatform.android).black.apply(
+          fontFamily: 'Roboto',
+          displayColor: scheme.onSurface,
+          bodyColor: scheme.onSurface,
+        );
+
+    final pageTransitionBuilder = const KoinlyPageTransitionsBuilder();
+
+    WidgetStateProperty<T> states<T>({required T normal, T? selected, T? pressed, T? disabled}) {
+      return WidgetStateProperty.resolveWith((state) {
+        if (state.contains(WidgetState.disabled)) return disabled ?? normal;
+        if (state.contains(WidgetState.pressed)) return pressed ?? selected ?? normal;
+        if (state.contains(WidgetState.selected)) return selected ?? normal;
+        return normal;
+      });
+    }
+
     return ThemeData(
       useMaterial3: true,
-      colorScheme: isDark ? darkScheme : scheme.copyWith(primary: kSleekAccent),
-      scaffoldBackgroundColor: isDark ? kSleekBackground : const Color(0xFFF5FAFB),
-      canvasColor: isDark ? kSleekBackground : const Color(0xFFF5FAFB),
-      visualDensity: VisualDensity.compact,
+      colorScheme: scheme,
+      scaffoldBackgroundColor: scheme.background,
+      canvasColor: scheme.background,
+      visualDensity: VisualDensity.standard,
       dividerColor: Colors.transparent,
+      splashFactory: InkSparkle.splashFactory,
+      textTheme: textTheme.copyWith(
+        displaySmall: textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w900, letterSpacing: -1.2),
+        headlineMedium: textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900, letterSpacing: -.7),
+        titleLarge: textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900, letterSpacing: -.2),
+        titleMedium: textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+        bodyMedium: textTheme.bodyMedium?.copyWith(height: 1.35),
+        bodyLarge: textTheme.bodyLarge?.copyWith(height: 1.35),
+      ),
+      pageTransitionsTheme: PageTransitionsTheme(
+        builders: {
+          TargetPlatform.android: pageTransitionBuilder,
+          TargetPlatform.windows: pageTransitionBuilder,
+          TargetPlatform.linux: pageTransitionBuilder,
+          TargetPlatform.macOS: pageTransitionBuilder,
+          TargetPlatform.iOS: pageTransitionBuilder,
+        },
+      ),
       cardTheme: CardThemeData(
         elevation: 0,
-        color: isDark ? kSleekSurface : Colors.white,
+        color: scheme.surface,
+        surfaceTintColor: scheme.surfaceTint,
         margin: EdgeInsets.zero,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(22)),
+        shape: AppShapes.squircle(26),
+      ),
+      dialogTheme: DialogThemeData(
+        backgroundColor: scheme.surface,
+        surfaceTintColor: scheme.surfaceTint,
+        shape: RoundedRectangleBorder(borderRadius: AppShapes.dialog),
+        titleTextStyle: textTheme.titleLarge?.copyWith(color: scheme.onSurface, fontWeight: FontWeight.w900),
+        contentTextStyle: textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant, height: 1.38),
+      ),
+      bottomSheetTheme: BottomSheetThemeData(
+        backgroundColor: scheme.surface,
+        surfaceTintColor: scheme.surfaceTint,
+        modalBackgroundColor: scheme.surface,
+        modalBarrierColor: Colors.black.withOpacity(isDark ? .62 : .36),
+        showDragHandle: true,
+        dragHandleColor: scheme.outlineVariant,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(kIsDesktopApp ? 34 : 30))),
+        constraints: const BoxConstraints(maxWidth: 720),
+      ),
+      snackBarTheme: SnackBarThemeData(
+        behavior: SnackBarBehavior.floating,
+        elevation: 0,
+        backgroundColor: isDark ? const Color(0xFF1C2B30) : const Color(0xFF0F172A),
+        contentTextStyle: const TextStyle(color: Colors.white, fontWeight: FontWeight.w800),
+        shape: RoundedRectangleBorder(borderRadius: AppShapes.medium),
+      ),
+      listTileTheme: ListTileThemeData(
+        minLeadingWidth: 46,
+        contentPadding: EdgeInsets.zero,
+        shape: AppShapes.squircle(22),
+        titleTextStyle: textTheme.titleSmall?.copyWith(color: scheme.onSurface, fontWeight: FontWeight.w900),
+        subtitleTextStyle: textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700),
+      ),
+      navigationRailTheme: NavigationRailThemeData(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        indicatorColor: kSleekAccent.withOpacity(isDark ? .26 : .18),
+        indicatorShape: AppShapes.squircle(22),
+        selectedIconTheme: const IconThemeData(color: kSleekAccent, size: 26),
+        unselectedIconTheme: IconThemeData(color: scheme.onSurfaceVariant.withOpacity(.82), size: 24),
+        selectedLabelTextStyle: const TextStyle(color: kSleekAccent, fontWeight: FontWeight.w900, fontSize: 12),
+        unselectedLabelTextStyle: TextStyle(color: scheme.onSurfaceVariant.withOpacity(.82), fontWeight: FontWeight.w800, fontSize: 11),
       ),
       navigationBarTheme: NavigationBarThemeData(
-        backgroundColor: isDark ? const Color(0xEE0B1417) : Colors.white,
-        indicatorColor: kSleekAccent.withOpacity(.18),
-        height: 76,
+        backgroundColor: isDark ? const Color(0xEE0B1417) : Colors.white.withOpacity(.96),
+        indicatorColor: kSleekAccent.withOpacity(isDark ? .24 : .18),
+        height: 78,
         elevation: 0,
         shadowColor: Colors.transparent,
-        labelTextStyle: WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w800, fontSize: 11, color: isDark ? const Color(0xFFE7F4F6) : const Color(0xFF0F172A))),
-        iconTheme: WidgetStateProperty.resolveWith((states) => IconThemeData(
-              color: states.contains(WidgetState.selected) ? kSleekAccent : (isDark ? const Color(0xFFB8C5CB) : const Color(0xFF64748B)),
-              size: states.contains(WidgetState.selected) ? 25 : 23,
+        surfaceTintColor: Colors.transparent,
+        labelTextStyle: WidgetStateProperty.resolveWith((state) => TextStyle(
+              fontWeight: FontWeight.w900,
+              fontSize: state.contains(WidgetState.selected) ? 12 : 11,
+              color: state.contains(WidgetState.selected) ? kSleekAccent : scheme.onSurfaceVariant,
+            )),
+        iconTheme: WidgetStateProperty.resolveWith((state) => IconThemeData(
+              color: state.contains(WidgetState.selected) ? kSleekAccent : scheme.onSurfaceVariant.withOpacity(.82),
+              size: state.contains(WidgetState.selected) ? 26 : 23,
             )),
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
-        fillColor: isDark ? kSleekSurfaceHigh : Colors.white,
-        hintStyle: TextStyle(color: isDark ? const Color(0xFF819099) : const Color(0xFF64748B)),
-        labelStyle: TextStyle(color: isDark ? const Color(0xFFB7C4CB) : const Color(0xFF475569)),
-        border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
-        enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none),
-        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide(color: kSleekAccent.withOpacity(.7), width: 1.2)),
+        fillColor: isDark ? scheme.surfaceContainerHigh.withOpacity(.82) : Colors.white,
+        hintStyle: TextStyle(color: scheme.onSurfaceVariant.withOpacity(.78), fontWeight: FontWeight.w600),
+        labelStyle: TextStyle(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700),
+        floatingLabelStyle: const TextStyle(color: kSleekAccent, fontWeight: FontWeight.w900),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+        border: OutlineInputBorder(borderRadius: AppShapes.medium, borderSide: BorderSide.none),
+        enabledBorder: OutlineInputBorder(borderRadius: AppShapes.medium, borderSide: BorderSide(color: scheme.outlineVariant.withOpacity(.45), width: 1)),
+        focusedBorder: OutlineInputBorder(borderRadius: AppShapes.large, borderSide: BorderSide(color: kSleekAccent.withOpacity(.78), width: 1.4)),
+        errorBorder: OutlineInputBorder(borderRadius: AppShapes.medium, borderSide: BorderSide(color: scheme.error.withOpacity(.72), width: 1.2)),
+        focusedErrorBorder: OutlineInputBorder(borderRadius: AppShapes.large, borderSide: BorderSide(color: scheme.error, width: 1.4)),
       ),
       filledButtonTheme: FilledButtonThemeData(
-        style: FilledButton.styleFrom(
-          backgroundColor: kSleekAccent,
-          foregroundColor: const Color(0xFF021012),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 15),
-          textStyle: const TextStyle(fontWeight: FontWeight.w900),
+        style: ButtonStyle(
+          backgroundColor: states(normal: kSleekAccent, pressed: kSleekAccent.withOpacity(.88), disabled: scheme.onSurface.withOpacity(.12)),
+          foregroundColor: states(normal: const Color(0xFF021012), disabled: scheme.onSurface.withOpacity(.38)),
+          overlayColor: WidgetStatePropertyAll(Colors.white.withOpacity(.10)),
+          shape: WidgetStateProperty.resolveWith((state) => AppShapes.squircle(state.contains(WidgetState.pressed) ? 22 : 18)),
+          padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 22, vertical: 16)),
+          minimumSize: const WidgetStatePropertyAll(Size(48, 50)),
+          textStyle: const WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w900, letterSpacing: -.1)),
+          elevation: states(normal: 0.0, pressed: 0.0),
+        ),
+      ),
+      textButtonTheme: TextButtonThemeData(
+        style: ButtonStyle(
+          foregroundColor: states(normal: kSleekAccent, pressed: kSleekAccent.withOpacity(.75)),
+          shape: WidgetStateProperty.resolveWith((state) => AppShapes.squircle(state.contains(WidgetState.pressed) ? 18 : 16)),
+          padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 14, vertical: 11)),
+          textStyle: const WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w900)),
         ),
       ),
       outlinedButtonTheme: OutlinedButtonThemeData(
-        style: OutlinedButton.styleFrom(
-          foregroundColor: isDark ? const Color(0xFFDDECEF) : const Color(0xFF0F172A),
-          side: BorderSide(color: isDark ? const Color(0xFF2E424A) : const Color(0xFFD1D5DB), width: 1.2),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 15),
+        style: ButtonStyle(
+          foregroundColor: states(normal: scheme.onSurface, pressed: kSleekAccent, disabled: scheme.onSurface.withOpacity(.38)),
+          side: states(
+            normal: BorderSide(color: scheme.outlineVariant.withOpacity(.95), width: 1.2),
+            pressed: BorderSide(color: kSleekAccent.withOpacity(.72), width: 1.3),
+            disabled: BorderSide(color: scheme.onSurface.withOpacity(.12), width: 1),
+          ),
+          shape: WidgetStateProperty.resolveWith((state) => AppShapes.squircle(state.contains(WidgetState.pressed) ? 22 : 18)),
+          padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 20, vertical: 15)),
+          minimumSize: const WidgetStatePropertyAll(Size(48, 50)),
+          textStyle: const WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w900)),
         ),
       ),
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: ButtonStyle(
-          backgroundColor: WidgetStateProperty.resolveWith((states) => states.contains(WidgetState.selected) ? kSleekAccent.withOpacity(.55) : (isDark ? kSleekSurface : Colors.white)),
-          foregroundColor: WidgetStateProperty.resolveWith((states) => states.contains(WidgetState.selected) ? const Color(0xFFEFFFFF) : (isDark ? const Color(0xFFB8C5CB) : const Color(0xFF334155))),
-          side: WidgetStatePropertyAll(BorderSide(color: isDark ? const Color(0xFF31424A) : const Color(0xFFD1D5DB), width: 1.2)),
-          shape: WidgetStatePropertyAll(RoundedRectangleBorder(borderRadius: BorderRadius.circular(18))),
-          textStyle: const WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w800)),
-          padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 13, horizontal: 16)),
+          backgroundColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.selected) ? kSleekAccent.withOpacity(isDark ? .42 : .22) : scheme.surfaceContainerHigh.withOpacity(isDark ? .58 : .72)),
+          foregroundColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.selected) ? (isDark ? Colors.white : const Color(0xFF003033)) : scheme.onSurfaceVariant),
+          side: WidgetStatePropertyAll(BorderSide(color: scheme.outlineVariant.withOpacity(.9), width: 1.1)),
+          shape: WidgetStatePropertyAll(AppShapes.squircle(22)),
+          textStyle: const WidgetStatePropertyAll(TextStyle(fontWeight: FontWeight.w900)),
+          padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(vertical: 14, horizontal: 16)),
         ),
       ),
       floatingActionButtonTheme: FloatingActionButtonThemeData(
         backgroundColor: kSleekAccent,
         foregroundColor: const Color(0xFF021012),
-        elevation: 10,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        elevation: 6,
+        highlightElevation: 2,
+        shape: AppShapes.squircle(22),
       ),
       iconButtonTheme: IconButtonThemeData(
-        style: IconButton.styleFrom(
-          backgroundColor: isDark ? kSleekSurfaceHigh.withOpacity(.75) : Colors.white,
-          foregroundColor: isDark ? const Color(0xFFE6F1F3) : const Color(0xFF0F172A),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        style: ButtonStyle(
+          backgroundColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.pressed) ? kSleekAccent.withOpacity(.16) : (isDark ? scheme.surfaceContainerHigh.withOpacity(.72) : Colors.white.withOpacity(.92))),
+          foregroundColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.pressed) ? kSleekAccent : scheme.onSurface),
+          shape: WidgetStateProperty.resolveWith((state) => AppShapes.squircle(state.contains(WidgetState.pressed) ? 18 : 16)),
+          minimumSize: const WidgetStatePropertyAll(Size(44, 44)),
         ),
       ),
       appBarTheme: AppBarTheme(
         centerTitle: false,
         elevation: 0,
         scrolledUnderElevation: 0,
-        backgroundColor: isDark ? kSleekBackground : const Color(0xFFF5FAFB),
+        backgroundColor: scheme.background,
         surfaceTintColor: Colors.transparent,
-        iconTheme: IconThemeData(color: isDark ? const Color(0xFFE6F1F3) : const Color(0xFF0F172A)),
-        titleTextStyle: TextStyle(color: isDark ? const Color(0xFFE6F1F3) : const Color(0xFF0F172A), fontWeight: FontWeight.w900, fontSize: 26),
+        iconTheme: IconThemeData(color: scheme.onSurface),
+        titleTextStyle: textTheme.headlineSmall?.copyWith(color: scheme.onSurface, fontWeight: FontWeight.w900, letterSpacing: -.6),
       ),
       chipTheme: ChipThemeData(
-        backgroundColor: isDark ? kSleekSurfaceHigh : const Color(0xFFEFF6F8),
-        selectedColor: kSleekAccent.withOpacity(.45),
-        side: BorderSide(color: isDark ? const Color(0xFF2E424A) : const Color(0xFFD9E5E8)),
-        labelStyle: TextStyle(color: isDark ? const Color(0xFFE6F1F3) : const Color(0xFF0F172A), fontWeight: FontWeight.w700),
+        backgroundColor: scheme.surfaceContainerHigh,
+        selectedColor: kSleekAccent.withOpacity(isDark ? .34 : .22),
+        disabledColor: scheme.onSurface.withOpacity(.08),
+        side: BorderSide(color: scheme.outlineVariant.withOpacity(.92)),
+        shape: AppShapes.squircle(18),
+        labelStyle: TextStyle(color: scheme.onSurface, fontWeight: FontWeight.w800),
+        secondaryLabelStyle: const TextStyle(color: kSleekAccent, fontWeight: FontWeight.w900),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      ),
+      progressIndicatorTheme: const ProgressIndicatorThemeData(color: kSleekAccent, linearTrackColor: Color(0x3324C7D8)),
+      switchTheme: SwitchThemeData(
+        thumbColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.selected) ? const Color(0xFF002022) : scheme.outline),
+        trackColor: WidgetStateProperty.resolveWith((state) => state.contains(WidgetState.selected) ? kSleekAccent : scheme.surfaceContainerHighest),
+        trackOutlineColor: WidgetStatePropertyAll(scheme.outlineVariant),
       ),
     );
   }
 }
+
 class StartupGate extends StatelessWidget {
   const StartupGate({super.key});
 
@@ -2053,8 +3484,264 @@ class StartupGate extends StatelessWidget {
     final state = context.watch<AppController>();
     if (state.loading) return const SplashScreen();
     if (!state.authenticated) return const LockScreen();
-    if (!state.onboardingCompleted) return const OnboardingScreen();
-    return const MainShell();
+    if (!state.setupCompletedForCurrentPlatform) return const OnboardingScreen();
+    return const FinancialHealthReviewGate(child: MainShell());
+  }
+}
+
+
+class FinancialHealthReviewGate extends StatefulWidget {
+  const FinancialHealthReviewGate({super.key, required this.child});
+
+  final Widget child;
+
+  @override
+  State<FinancialHealthReviewGate> createState() => _FinancialHealthReviewGateState();
+}
+
+class _FinancialHealthReviewGateState extends State<FinancialHealthReviewGate> {
+  bool _scheduled = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_scheduled) return;
+    _scheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      final state = context.read<AppController>();
+      final prompts = pendingFinancialHealthReviewPrompts(state);
+      if (prompts.isEmpty) return;
+      await showKoinlyPopup<void>(
+        context,
+        maxWidth: 680,
+        maxHeight: 800,
+        barrierDismissible: false,
+        child: FinancialHealthReviewDialog(prompts: prompts),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+class FinancialHealthReviewPrompt {
+  const FinancialHealthReviewPrompt({required this.period, required this.selectedDate});
+
+  final FinancialHealthPeriod period;
+  final DateTime selectedDate;
+
+  String get key => financialHealthSummaryKey(period, selectedDate);
+  String get label => financialPeriodLabel(period, selectedDate);
+  String get title => period == FinancialHealthPeriod.monthly ? 'Monthly Summary Ready' : 'Yearly Summary Ready';
+  String get subtitle => period == FinancialHealthPeriod.monthly ? '$label has ended. Review your financial health.' : '$label has ended. Review your yearly financial health.';
+}
+
+String financialHealthSummaryKey(FinancialHealthPeriod period, DateTime selectedDate) {
+  return period == FinancialHealthPeriod.monthly ? "monthly:${DateFormat('yyyy-MM').format(selectedDate)}" : "yearly:${selectedDate.year}";
+}
+
+List<FinancialHealthReviewPrompt> pendingFinancialHealthReviewPrompts(AppController state, [DateTime? date]) {
+  final now = date ?? DateTime.now();
+  final prompts = <FinancialHealthReviewPrompt>[
+    FinancialHealthReviewPrompt(period: FinancialHealthPeriod.monthly, selectedDate: DateTime(now.year, now.month - 1, 1)),
+    FinancialHealthReviewPrompt(period: FinancialHealthPeriod.yearly, selectedDate: DateTime(now.year - 1, 1, 1)),
+  ];
+
+  return prompts.where((prompt) {
+    if (state.dismissedFinancialHealthSummaryKeys.contains(prompt.key)) return false;
+    return financialHealthSummaryHasActivity(state, prompt);
+  }).toList();
+}
+
+bool financialHealthSummaryHasActivity(AppController state, FinancialHealthReviewPrompt prompt) {
+  final summary = FinancialHealthSummary.build(state, period: prompt.period, selectedDate: prompt.selectedDate);
+  return summary.income > 0 ||
+      summary.expense > 0 ||
+      summary.savingsIn > 0 ||
+      summary.savingsOut > 0 ||
+      summary.loansGiven > 0 ||
+      summary.loansTaken > 0 ||
+      summary.loanRepaymentPaid > 0 ||
+      summary.loanRepaymentReceived > 0 ||
+      summary.billPaymentCount > 0 ||
+      summary.billUnpaidCount > 0 ||
+      summary.billUpcomingCount > 0 ||
+      summary.billOverdueCount > 0 ||
+      summary.loanReminderCompletedCount > 0 ||
+      summary.loanReminderPendingCount > 0 ||
+      summary.loanReminderPartialCount > 0 ||
+      summary.loanReminderOverdueCount > 0 ||
+      summary.budgetItems.isNotEmpty;
+}
+
+class FinancialHealthReviewDialog extends StatefulWidget {
+  const FinancialHealthReviewDialog({super.key, required this.prompts});
+
+  final List<FinancialHealthReviewPrompt> prompts;
+
+  @override
+  State<FinancialHealthReviewDialog> createState() => _FinancialHealthReviewDialogState();
+}
+
+class _FinancialHealthReviewDialogState extends State<FinancialHealthReviewDialog> {
+  late final PageController _pageController;
+  int _index = 0;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _pageController = PageController();
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _skipAll() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final state = context.read<AppController>();
+    await state.dismissFinancialHealthSummaries(widget.prompts.map((prompt) => prompt.key));
+    if (mounted) Navigator.pop(context);
+  }
+
+  Future<void> _continue() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final state = context.read<AppController>();
+    await state.dismissFinancialHealthSummary(widget.prompts[_index].key);
+    if (!mounted) return;
+    if (_index >= widget.prompts.length - 1) {
+      Navigator.pop(context);
+      return;
+    }
+    setState(() {
+      _busy = false;
+      _index += 1;
+    });
+    await _pageController.animateToPage(_index, duration: AppMotion.medium, curve: AppMotion.emphasized);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppController>();
+    final prompt = widget.prompts[_index];
+    final last = _index >= widget.prompts.length - 1;
+
+    return SizedBox(
+      height: 760,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 18, 18, 10),
+            child: Row(
+              children: [
+                iconBubble(context, prompt.period == FinancialHealthPeriod.monthly ? 'month' : 'year', prompt.period == FinancialHealthPeriod.monthly ? '#78D8E8' : '#FBC879', size: 48),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(prompt.title, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+                      Text(prompt.subtitle, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+                if (widget.prompts.length > 1)
+                  Chip(
+                    label: Text('${_index + 1}/${widget.prompts.length}'),
+                    avatar: const Icon(Icons.auto_stories_rounded, size: 17),
+                  ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: PageView.builder(
+              controller: _pageController,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: widget.prompts.length,
+              itemBuilder: (context, index) {
+                final item = widget.prompts[index];
+                final summary = FinancialHealthSummary.build(state, period: item.period, selectedDate: item.selectedDate);
+                return SingleChildScrollView(
+                  physics: optimizedScrollPhysics(context),
+                  padding: const EdgeInsets.fromLTRB(18, 4, 18, 8),
+                  child: FinancialHealthSummarySection(summary: summary),
+                );
+              },
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
+            child: Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _busy ? null : _skipAll,
+                    icon: const Icon(Icons.skip_next_rounded),
+                    label: const Text('Skip all'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _busy ? null : _continue,
+                    icon: Icon(last ? Icons.done_rounded : Icons.arrow_forward_rounded),
+                    label: Text(last ? 'Done' : 'Next'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class KoinlyAppIcon extends StatelessWidget {
+  const KoinlyAppIcon({super.key, this.size = 88, this.borderRadius});
+
+  final double size;
+  final double? borderRadius;
+
+  @override
+  Widget build(BuildContext context) {
+    final radius = borderRadius ?? size * .28;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(radius),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(.22),
+            blurRadius: size * .18,
+            offset: Offset(0, size * .08),
+          ),
+        ],
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: Image.asset(
+          'assets/icons/app_icon.png',
+          fit: BoxFit.cover,
+          filterQuality: FilterQuality.high,
+          errorBuilder: (context, error, stackTrace) => DecoratedBox(
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(radius),
+              gradient: LinearGradient(colors: [Theme.of(context).colorScheme.primary, Theme.of(context).colorScheme.tertiary]),
+            ),
+            child: const Icon(Icons.account_balance_wallet_rounded, color: Colors.white),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -2068,18 +3755,7 @@ class SplashScreen extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Hero(
-              tag: 'app-icon',
-              child: Container(
-                width: 92,
-                height: 92,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(30),
-                  gradient: LinearGradient(colors: [Theme.of(context).colorScheme.primary, Theme.of(context).colorScheme.tertiary]),
-                ),
-                child: const Icon(Icons.account_balance_wallet_rounded, size: 48, color: Colors.white),
-              ),
-            ),
+            const KoinlyAppIcon(size: 92, borderRadius: 30),
             const SizedBox(height: 24),
             Text(appTitle, style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900)),
             const SizedBox(height: 16),
@@ -2160,36 +3836,70 @@ class MainShell extends StatelessWidget {
               )
             : null;
 
-    return Scaffold(
-      extendBody: true,
-      body: Stack(
-        children: [
-          Positioned.fill(
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 260),
-              child: pages[state.tabIndex],
-            ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final useDesktopNavigation = constraints.maxWidth >= 900;
+        final extendDesktopNavigation = constraints.maxWidth >= 1180;
+
+        void selectTab(int index) {
+          state.tabIndex = index;
+          state.notifyListeners();
+        }
+
+        return Scaffold(
+          extendBody: !useDesktopNavigation,
+          body: Row(
+            children: [
+              if (useDesktopNavigation)
+                _SideRailNavigation(
+                  selectedIndex: state.tabIndex,
+                  extended: extendDesktopNavigation,
+                  onSelected: selectTab,
+                ),
+              Expanded(
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: AnimatedSwitcher(
+                        duration: AppMotion.medium,
+                        switchInCurve: AppMotion.emphasized,
+                        switchOutCurve: AppMotion.emphasizedAccelerate,
+                        transitionBuilder: (child, animation) {
+                          final curved = CurvedAnimation(parent: animation, curve: AppMotion.emphasized);
+                          return FadeTransition(
+                            opacity: curved,
+                            child: SlideTransition(
+                              position: Tween<Offset>(begin: const Offset(.018, 0), end: Offset.zero).animate(curved),
+                              child: ScaleTransition(scale: Tween<double>(begin: .992, end: 1).animate(curved), child: child),
+                            ),
+                          );
+                        },
+                        child: KeyedSubtree(key: ValueKey<int>(state.tabIndex), child: pages[state.tabIndex]),
+                      ),
+                    ),
+                    if (actionButton != null)
+                      Positioned(
+                        right: useDesktopNavigation ? 34 : 28,
+                        bottom: MediaQuery.of(context).padding.bottom + (useDesktopNavigation ? 30 : 102),
+                        child: actionButton,
+                      ),
+                    if (!useDesktopNavigation)
+                      Positioned(
+                        left: 0,
+                        right: 0,
+                        bottom: 0,
+                        child: _FloatingDockNavigation(
+                          selectedIndex: state.tabIndex,
+                          onSelected: selectTab,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          if (actionButton != null)
-            Positioned(
-              right: 28,
-              bottom: MediaQuery.of(context).padding.bottom + 102,
-              child: actionButton,
-            ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: _FloatingDockNavigation(
-              selectedIndex: state.tabIndex,
-              onSelected: (index) {
-                state.tabIndex = index;
-                state.notifyListeners();
-              },
-            ),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -2204,6 +3914,108 @@ class _DockDestination {
   final String label;
   final IconData icon;
   final IconData activeIcon;
+}
+
+class _SideRailNavigation extends StatelessWidget {
+  const _SideRailNavigation({
+    required this.selectedIndex,
+    required this.extended,
+    required this.onSelected,
+  });
+
+  final int selectedIndex;
+  final bool extended;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final borderColor = dark ? Colors.white.withOpacity(.06) : scheme.outline.withOpacity(.14);
+    final railColor = dark ? const Color(0xFF081316) : Colors.white;
+
+    return Material(
+      color: railColor,
+      child: SafeArea(
+        right: false,
+        child: Container(
+          width: extended ? 238 : 92,
+          decoration: BoxDecoration(
+            border: Border(right: BorderSide(color: borderColor, width: 1)),
+            boxShadow: kIsDesktopApp
+                ? null
+                : [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(dark ? .18 : .035),
+                      blurRadius: 18,
+                      offset: const Offset(6, 0),
+                    ),
+                  ],
+          ),
+          child: Column(
+            children: [
+              Padding(
+                padding: EdgeInsets.fromLTRB(extended ? 20 : 14, 18, extended ? 20 : 14, 10),
+                child: Row(
+                  mainAxisAlignment: extended ? MainAxisAlignment.start : MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 46,
+                      height: 46,
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(17),
+                        gradient: LinearGradient(colors: [kSleekAccent, scheme.tertiary]),
+                        boxShadow: [BoxShadow(color: kSleekAccent.withOpacity(.20), blurRadius: 18, offset: const Offset(0, 8))],
+                      ),
+                      child: const Icon(Icons.account_balance_wallet_rounded, color: Colors.white),
+                    ),
+                    if (extended) ...[
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(appTitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+                            Text('Desktop', style: Theme.of(context).textTheme.labelSmall?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w800)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              Expanded(
+                child: NavigationRail(
+                  selectedIndex: selectedIndex,
+                  extended: extended,
+                  minWidth: 92,
+                  minExtendedWidth: 238,
+                  groupAlignment: -0.86,
+                  backgroundColor: Colors.transparent,
+                  indicatorColor: kSleekAccent.withOpacity(dark ? .26 : .16),
+                  labelType: extended ? NavigationRailLabelType.none : NavigationRailLabelType.all,
+                  selectedIconTheme: const IconThemeData(color: kSleekAccent, size: 26),
+                  unselectedIconTheme: IconThemeData(color: scheme.onSurfaceVariant.withOpacity(.82), size: 24),
+                  selectedLabelTextStyle: const TextStyle(color: kSleekAccent, fontWeight: FontWeight.w900, fontSize: 12),
+                  unselectedLabelTextStyle: TextStyle(color: scheme.onSurfaceVariant.withOpacity(.82), fontWeight: FontWeight.w800, fontSize: 11),
+                  onDestinationSelected: onSelected,
+                  destinations: _FloatingDockNavigation._destinations
+                      .map(
+                        (destination) => NavigationRailDestination(
+                          icon: Icon(destination.icon),
+                          selectedIcon: Icon(destination.activeIcon),
+                          label: Text(destination.label, maxLines: 1, overflow: TextOverflow.ellipsis),
+                        ),
+                      )
+                      .toList(),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _FloatingDockNavigation extends StatelessWidget {
@@ -2267,8 +4079,8 @@ class _FloatingDockNavigation extends StatelessWidget {
                         onTap: () => onSelected(index),
                         child: Center(
                           child: AnimatedContainer(
-                            duration: const Duration(milliseconds: 190),
-                            curve: Curves.easeOutCubic,
+                            duration: AppMotion.fast,
+                            curve: AppMotion.spring,
                             width: selected ? 58 : 48,
                             height: selected ? 58 : 48,
                             decoration: BoxDecoration(
@@ -2310,19 +4122,22 @@ class PageScaffold extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final small = AppBreakpoints.isSmall(context);
+    final desktop = AppBreakpoints.isExpanded(context);
     return Scaffold(
       backgroundColor: scheme.background,
       appBar: AppBar(
-        toolbarHeight: 78,
-        titleSpacing: 18,
+        toolbarHeight: desktop ? 84 : small ? 68 : 76,
+        titleSpacing: small ? 12 : 18,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Text(title, style: Theme.of(context).appBarTheme.titleTextStyle?.copyWith(fontSize: 28)),
+            Text(title, maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).appBarTheme.titleTextStyle?.copyWith(fontSize: desktop ? 30 : small ? 23 : 27)),
             if (subtitle != null)
               Padding(
                 padding: const EdgeInsets.only(top: 2),
-                child: Text(subtitle!, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700)),
+                child: Text(subtitle!, maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700)),
               ),
           ],
         ),
@@ -2339,23 +4154,120 @@ class PageScaffold extends StatelessWidget {
 }
 
 class ResponsiveContent extends StatelessWidget {
-  const ResponsiveContent({super.key, required this.child, this.padding = const EdgeInsets.fromLTRB(16, 8, 16, 110)});
+  const ResponsiveContent({
+    super.key,
+    required this.child,
+    this.padding,
+    this.mobileMaxWidth = 720,
+    this.desktopMaxWidth = 1180,
+  });
+
   final Widget child;
-  final EdgeInsets padding;
+  final EdgeInsets? padding;
+  final double mobileMaxWidth;
+  final double desktopMaxWidth;
 
   @override
   Widget build(BuildContext context) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final width = constraints.maxWidth > 720 ? 720.0 : constraints.maxWidth;
+        final screenWidth = MediaQuery.sizeOf(context).width;
+        final small = screenWidth < AppBreakpoints.compact;
+        final medium = screenWidth >= AppBreakpoints.medium;
+        final desktop = screenWidth >= AppBreakpoints.expanded;
+        final large = screenWidth >= AppBreakpoints.large;
+        final maxContentWidth = desktop ? (large ? desktopMaxWidth : math.min(desktopMaxWidth, 1040.0)) : (medium ? mobileMaxWidth : constraints.maxWidth);
+        final double width = math.min(constraints.maxWidth, maxContentWidth).toDouble();
+        final resolvedPadding = padding ??
+            EdgeInsets.fromLTRB(
+              desktop ? 32 : small ? 12 : 16,
+              desktop ? 22 : small ? 6 : 8,
+              desktop ? 32 : small ? 12 : 16,
+              desktop ? 42 : small ? 96 : 110,
+            );
+
         return Align(
           alignment: Alignment.topCenter,
           child: SizedBox(
             width: width,
-            child: SingleChildScrollView(
-              padding: padding,
-              physics: const BouncingScrollPhysics(),
-              child: child,
+            child: ListView(
+              padding: resolvedPadding,
+              physics: optimizedScrollPhysics(context),
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              cacheExtent: kIsDesktopApp ? 900 : 320,
+              children: [RepaintBoundary(child: child)],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+
+class ResponsiveListContent extends StatelessWidget {
+  const ResponsiveListContent({
+    super.key,
+    required this.itemCount,
+    required this.itemBuilder,
+    this.header = const [],
+    this.empty,
+    this.padding,
+    this.mobileMaxWidth = 720,
+    this.desktopMaxWidth = 1180,
+    this.itemSpacing = 10,
+  });
+
+  final int itemCount;
+  final IndexedWidgetBuilder itemBuilder;
+  final List<Widget> header;
+  final Widget? empty;
+  final EdgeInsets? padding;
+  final double mobileMaxWidth;
+  final double desktopMaxWidth;
+  final double itemSpacing;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final screenWidth = MediaQuery.sizeOf(context).width;
+        final small = screenWidth < AppBreakpoints.compact;
+        final medium = screenWidth >= AppBreakpoints.medium;
+        final desktop = screenWidth >= AppBreakpoints.expanded;
+        final large = screenWidth >= AppBreakpoints.large;
+        final maxContentWidth = desktop ? (large ? desktopMaxWidth : math.min(desktopMaxWidth, 1040.0)) : (medium ? mobileMaxWidth : constraints.maxWidth);
+        final double width = math.min(constraints.maxWidth, maxContentWidth).toDouble();
+        final resolvedPadding = padding ??
+            EdgeInsets.fromLTRB(
+              desktop ? 32 : small ? 12 : 16,
+              desktop ? 22 : small ? 6 : 8,
+              desktop ? 32 : small ? 12 : 16,
+              desktop ? 42 : small ? 96 : 110,
+            );
+        final bodyCount = itemCount == 0 && empty != null ? 1 : itemCount;
+
+        return Align(
+          alignment: Alignment.topCenter,
+          child: SizedBox(
+            width: width,
+            child: ListView.builder(
+              padding: resolvedPadding,
+              physics: optimizedScrollPhysics(context),
+              keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+              cacheExtent: kIsDesktopApp ? 1100 : 420,
+              itemCount: header.length + bodyCount,
+              itemBuilder: (context, index) {
+                if (index < header.length) return RepaintBoundary(child: header[index]);
+                final bodyIndex = index - header.length;
+                if (itemCount == 0) return RepaintBoundary(child: empty!);
+                return RepaintBoundary(
+                  child: Padding(
+                    padding: EdgeInsets.only(bottom: itemSpacing),
+                    child: itemBuilder(context, bodyIndex),
+                  ),
+                );
+              },
             ),
           ),
         );
@@ -2365,29 +4277,60 @@ class ResponsiveContent extends StatelessWidget {
 }
 
 class ExpressiveCard extends StatelessWidget {
-  const ExpressiveCard({super.key, required this.child, this.padding = const EdgeInsets.all(18), this.color});
+  const ExpressiveCard({
+    super.key,
+    required this.child,
+    this.padding = const EdgeInsets.all(18),
+    this.color,
+    this.radius = 26,
+    this.surfaceTint = true,
+  });
+
   final Widget child;
   final EdgeInsets padding;
   final Color? color;
+  final double radius;
+  final bool surfaceTint;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final dark = Theme.of(context).brightness == Brightness.dark;
-    final baseColor = color ?? (dark ? kSleekSurface : Colors.white);
-    return Container(
+    final baseColor = color ?? (dark ? scheme.surfaceContainer : Colors.white);
+    final borderColor = dark ? Colors.white.withOpacity(.065) : scheme.outlineVariant.withOpacity(.74);
+    return AnimatedContainer(
+      duration: AppMotion.medium,
+      curve: AppMotion.emphasized,
       decoration: BoxDecoration(
         color: baseColor,
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: dark ? const Color(0xFF1F3036) : const Color(0xFFE4EEF1), width: 1),
-        boxShadow: [
-          if (dark)
-            BoxShadow(color: Colors.black.withOpacity(.22), blurRadius: 18, offset: const Offset(0, 10))
-          else
-            BoxShadow(color: scheme.shadow.withOpacity(.06), blurRadius: 18, offset: const Offset(0, 10)),
-        ],
+        gradient: surfaceTint
+            ? LinearGradient(
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+                colors: [
+                  Color.alphaBlend(kSleekAccent.withOpacity(dark ? .025 : .030), baseColor),
+                  baseColor,
+                  Color.alphaBlend(scheme.tertiary.withOpacity(dark ? .018 : .022), baseColor),
+                ],
+              )
+            : null,
+        borderRadius: BorderRadius.circular(radius),
+        border: Border.all(color: borderColor, width: 1),
+        boxShadow: kIsDesktopApp
+            ? [
+                BoxShadow(color: Colors.black.withOpacity(dark ? .10 : .025), blurRadius: 18, offset: const Offset(0, 8)),
+              ]
+            : [
+                if (dark)
+                  BoxShadow(color: Colors.black.withOpacity(.20), blurRadius: 18, offset: const Offset(0, 9))
+                else
+                  BoxShadow(color: scheme.shadow.withOpacity(.060), blurRadius: 18, offset: const Offset(0, 9)),
+              ],
       ),
-      child: Padding(padding: padding, child: child),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(radius),
+        child: Padding(padding: padding, child: child),
+      ),
     );
   }
 }
@@ -2452,6 +4395,87 @@ class SleekPillSelector<T> extends StatelessWidget {
   }
 }
 
+class SleekCyclePillSelector<T> extends StatelessWidget {
+  const SleekCyclePillSelector({
+    super.key,
+    required this.options,
+    required this.selected,
+    required this.onChanged,
+  });
+
+  final List<SleekPillOption<T>> options;
+  final T selected;
+  final ValueChanged<T> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedIndex = options.indexWhere((option) => option.value == selected);
+    final currentIndex = selectedIndex < 0 ? 0 : selectedIndex;
+    final current = options[currentIndex];
+    final next = options[(currentIndex + 1) % options.length];
+    final selectedColor = kSleekAccent.withOpacity(.32);
+    final textColor = Theme.of(context).colorScheme.onSurface;
+    final mutedColor = Theme.of(context).colorScheme.onSurface.withOpacity(.60);
+
+    return MotionPressable(
+      onTap: () => onChanged(next.value),
+      borderRadius: AppShapes.medium,
+      child: Material(
+        color: selectedColor,
+        borderRadius: AppShapes.medium,
+        child: AnimatedContainer(
+          duration: AppMotion.fast,
+          curve: AppMotion.emphasized,
+          constraints: const BoxConstraints(minHeight: 64),
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          decoration: BoxDecoration(
+            borderRadius: AppShapes.medium,
+            border: Border.all(color: kSleekAccent.withOpacity(.42), width: 1.1),
+            boxShadow: [BoxShadow(color: kSleekAccent.withOpacity(.10), blurRadius: 16, offset: const Offset(0, 8))],
+          ),
+          child: Row(
+            children: [
+              if (current.icon != null) ...[
+                Icon(current.icon, size: 22, color: kSleekAccent),
+                const SizedBox(width: 12),
+              ],
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      current.label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            color: textColor,
+                            fontWeight: FontWeight.w900,
+                          ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'Tap to switch to ${next.label}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                            color: mutedColor,
+                            fontWeight: FontWeight.w800,
+                          ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Icon(Icons.swap_horiz_rounded, color: kSleekAccent, size: 24),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _SleekPillButton<T> extends StatelessWidget {
   const _SleekPillButton({
     required this.option,
@@ -2470,18 +4494,19 @@ class _SleekPillButton<T> extends StatelessWidget {
     final borderColor = selected ? kSleekAccent.withOpacity(.42) : Theme.of(context).colorScheme.outline.withOpacity(.24);
     final textColor = selected ? Colors.white : Theme.of(context).colorScheme.onSurface.withOpacity(.76);
 
-    return Material(
-      color: selected ? selectedColor : unselectedColor,
-      borderRadius: BorderRadius.circular(20),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(20),
-        onTap: onTap,
+    return MotionPressable(
+      onTap: onTap,
+      borderRadius: AppShapes.medium,
+      child: Material(
+        color: selected ? selectedColor : unselectedColor,
+        borderRadius: AppShapes.medium,
         child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
+          duration: AppMotion.fast,
+          curve: AppMotion.emphasized,
           constraints: const BoxConstraints(minHeight: 58),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          padding: EdgeInsets.symmetric(horizontal: AppBreakpoints.isSmall(context) ? 8 : 12, vertical: 12),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(20),
+            borderRadius: AppShapes.medium,
             border: Border.all(color: borderColor, width: 1),
             boxShadow: selected
                 ? [BoxShadow(color: kSleekAccent.withOpacity(.10), blurRadius: 16, offset: const Offset(0, 8))]
@@ -2491,19 +4516,22 @@ class _SleekPillButton<T> extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               if (option.icon != null) ...[
-                Icon(option.icon, size: 20, color: selected ? kSleekAccent : textColor),
-                const SizedBox(width: 8),
+                Icon(option.icon, size: AppBreakpoints.isSmall(context) ? 18 : 20, color: selected ? kSleekAccent : textColor),
+                SizedBox(width: AppBreakpoints.isSmall(context) ? 5 : 8),
               ],
               Flexible(
-                child: Text(
-                  option.label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  textAlign: TextAlign.center,
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                        color: textColor,
-                        fontWeight: FontWeight.w900,
-                      ),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  alignment: Alignment.center,
+                  child: Text(
+                    option.label,
+                    maxLines: 1,
+                    textAlign: TextAlign.center,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          color: textColor,
+                          fontWeight: FontWeight.w900,
+                        ),
+                  ),
                 ),
               ),
             ],
@@ -2549,6 +4577,17 @@ IconData iconFor(String name) {
     case 'bus': return Icons.directions_bus_rounded;
     case 'train': return Icons.train_rounded;
     case 'flight': return Icons.flight_rounded;
+    case 'anime': return Icons.auto_awesome_rounded;
+    case 'manga': return Icons.auto_stories_rounded;
+    case 'collectibles': return Icons.toys_rounded;
+    case 'headphones': return Icons.headphones_rounded;
+    case 'keyboard': return Icons.keyboard_rounded;
+    case 'laptop': return Icons.laptop_mac_rounded;
+    case 'monitor': return Icons.desktop_windows_rounded;
+    case 'mic': return Icons.mic_rounded;
+    case 'video': return Icons.videocam_rounded;
+    case 'art': return Icons.brush_rounded;
+    case 'subscription': return Icons.subscriptions_rounded;
     case 'fuel': return Icons.local_gas_station_rounded;
     case 'home': return Icons.home_rounded;
     case 'house': return Icons.house_rounded;
@@ -2582,15 +4621,72 @@ IconData iconFor(String name) {
     case 'parking': return Icons.local_parking_rounded;
     case 'calendar': return Icons.calendar_month_rounded;
     case 'time': return Icons.schedule_rounded;
+    case 'schedule': return Icons.schedule_rounded;
+    case 'camera_alt': return Icons.photo_camera_rounded;
+    case 'sports_esports': return Icons.sports_esports_rounded;
+    case 'filter': return Icons.filter_alt_rounded;
+    case 'today': return Icons.today_rounded;
+    case 'week': return Icons.view_week_rounded;
+    case 'month': return Icons.calendar_month_rounded;
+    case 'year': return Icons.event_note_rounded;
+    case 'all_time': return Icons.all_inclusive_rounded;
+    case 'custom_range': return Icons.date_range_rounded;
+    case 'theme_system': return Icons.devices_rounded;
+    case 'theme_light': return Icons.light_mode_rounded;
+    case 'theme_dark': return Icons.dark_mode_rounded;
+    case 'theme_battery': return Icons.battery_saver_rounded;
     case 'flag': return Icons.flag_rounded;
     case 'profile': return Icons.account_circle_rounded;
     case 'loan_given': return Icons.call_made_rounded;
     case 'loan_taken': return Icons.call_received_rounded;
     case 'loan_received': return Icons.south_west_rounded;
     case 'loan_paid': return Icons.north_east_rounded;
+    case 'warning': return Icons.warning_amber_rounded;
+    case 'reminder': return Icons.notifications_active_rounded;
     default: return Icons.category_rounded;
   }
 }
+bool isImageIcon(String name) => name == 'origami_bird';
+
+String imageIconAsset(String name) {
+  switch (name) {
+    case 'origami_bird':
+      return 'assets/icons/origami_bird.png';
+    default:
+      return '';
+  }
+}
+
+Widget iconGlyph(
+  BuildContext context,
+  String icon, {
+  required Color color,
+  required double size,
+  Color? imageBackground,
+}) {
+  if (isImageIcon(icon)) {
+    return Container(
+      width: size,
+      height: size,
+      padding: EdgeInsets.all(size * .10),
+      decoration: imageBackground == null || icon == 'origami_bird'
+          ? null
+          : BoxDecoration(
+              color: imageBackground,
+              borderRadius: BorderRadius.circular(size * .28),
+            ),
+      child: Image.asset(
+        imageIconAsset(icon),
+        width: size,
+        height: size,
+        fit: BoxFit.contain,
+        filterQuality: FilterQuality.high,
+      ),
+    );
+  }
+  return Icon(iconFor(icon), color: color, size: size);
+}
+
 Widget iconBubble(BuildContext context, String icon, String color, {double size = 44}) {
   final c = colorFromHex(color, fallback: Theme.of(context).colorScheme.primary);
   return Container(
@@ -2600,9 +4696,17 @@ Widget iconBubble(BuildContext context, String icon, String color, {double size 
       color: c.withOpacity(.16),
       borderRadius: BorderRadius.circular(size * .32),
       border: Border.all(color: c.withOpacity(.25), width: 1),
-      boxShadow: [BoxShadow(color: c.withOpacity(.12), blurRadius: 12, offset: const Offset(0, 5))],
+      boxShadow: kIsDesktopApp ? null : [BoxShadow(color: c.withOpacity(.10), blurRadius: 10, offset: const Offset(0, 4))],
     ),
-    child: Icon(iconFor(icon), color: c, size: size * .52),
+    child: Center(
+      child: iconGlyph(
+        context,
+        icon,
+        color: c,
+        size: size * .56,
+        imageBackground: Colors.white.withOpacity(.84),
+      ),
+    ),
   );
 }
 
@@ -2627,7 +4731,11 @@ class SelectionOption {
 SelectionOption optionFromAccount(Account account, AppController state) => SelectionOption(
       id: account.id,
       title: account.name,
-      subtitle: account.type == AccountType.credit ? 'Credit • Available ${state.format(account.availableCredit)}' : 'Regular account',
+      subtitle: account.type == AccountType.credit
+          ? 'Credit • Available ${state.format(account.availableCredit)}'
+          : account.type == AccountType.savings
+              ? 'Savings account'
+              : 'Regular account',
       iconName: account.iconName,
       iconColor: account.iconColor,
     );
@@ -2745,140 +4853,125 @@ Future<String?> showAppleWheelSelectionSheet(
   var selectedIndex = initialIndex;
   final pickerController = FixedExtentScrollController(initialItem: initialIndex);
 
-  final result = await showModalBottomSheet<String>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    builder: (sheetContext) {
-      return StatefulBuilder(
-        builder: (context, setModalState) {
-          final safeIndex = selectedIndex < 0 ? 0 : selectedIndex >= options.length ? options.length - 1 : selectedIndex;
-          final selected = options[safeIndex];
-          final scheme = Theme.of(context).colorScheme;
-          final dark = Theme.of(context).brightness == Brightness.dark;
-          final sheetColor = dark ? const Color(0xFF10191D) : Colors.white;
-          final innerColor = dark ? const Color(0xFF0B1417) : const Color(0xFFF5FAFB);
-          final borderColor = dark ? const Color(0xFF24343A) : const Color(0xFFDCE8EB);
-          final innerBorderColor = dark ? const Color(0xFF1F3036) : const Color(0xFFDCE8EB);
-          final handleColor = dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE);
+  final result = await showKoinlyPopup<String>(
+    context,
+    maxWidth: 520,
+    maxHeight: 560,
+    child: StatefulBuilder(
+      builder: (dialogContext, setModalState) {
+        final safeIndex = selectedIndex < 0 ? 0 : selectedIndex >= options.length ? options.length - 1 : selectedIndex;
+        final selected = options[safeIndex];
+        final dark = Theme.of(dialogContext).brightness == Brightness.dark;
+        final innerColor = dark ? const Color(0xFF0B1417) : const Color(0xFFF5FAFB);
+        final innerBorderColor = dark ? const Color(0xFF1F3036) : const Color(0xFFDCE8EB);
+        final handleColor = dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE);
 
-          return SafeArea(
-            top: false,
-            child: Container(
-              margin: const EdgeInsets.all(12),
-              padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-              decoration: BoxDecoration(
-                color: sheetColor,
-                borderRadius: BorderRadius.circular(28),
-                border: Border.all(color: borderColor),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(.45), blurRadius: 28, offset: const Offset(0, -8))],
+        return SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 44,
+                height: 5,
+                decoration: BoxDecoration(color: handleColor, borderRadius: BorderRadius.circular(999)),
               ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+              const SizedBox(height: 18),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: Theme.of(dialogContext).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                height: 252,
+                decoration: BoxDecoration(
+                  color: innerColor,
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: innerBorderColor),
+                ),
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    IgnorePointer(
+                      child: Container(
+                        height: 72,
+                        margin: const EdgeInsets.symmetric(horizontal: 12),
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(18),
+                          color: kSleekAccent.withOpacity(.10),
+                          border: Border.all(color: kSleekAccent.withOpacity(.28), width: 1.1),
+                        ),
+                      ),
+                    ),
+                    ListWheelScrollView.useDelegate(
+                      controller: pickerController,
+                      itemExtent: 72,
+                      diameterRatio: 100000,
+                      perspective: 0.0001,
+                      squeeze: 1.0,
+                      physics: const FixedExtentScrollPhysics(),
+                      overAndUnderCenterOpacity: .34,
+                      onSelectedItemChanged: (index) => setModalState(() => selectedIndex = index),
+                      childDelegate: ListWheelChildBuilderDelegate(
+                        childCount: options.length,
+                        builder: (context, index) {
+                          final option = options[index];
+                          final isSelected = index == safeIndex;
+                          return _AppleWheelOptionRow(option: option, selected: isSelected);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                child: Row(
+                  key: ValueKey(selected.id),
+                  children: [
+                    iconBubble(dialogContext, selected.iconName, selected.iconColor, size: 40),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        selected.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(dialogContext).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
+                      ),
+                    ),
+                    Text(
+                      selected.subtitle,
+                      style: Theme.of(dialogContext).textTheme.labelMedium?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w800),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Row(
                 children: [
-                  Container(
-                    width: 44,
-                    height: 5,
-                    decoration: BoxDecoration(color: handleColor, borderRadius: BorderRadius.circular(999)),
-                  ),
-                  const SizedBox(height: 18),
-                  Text(
-                    title,
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    height: 252,
-                    decoration: BoxDecoration(
-                      color: innerColor,
-                      borderRadius: BorderRadius.circular(22),
-                      border: Border.all(color: innerBorderColor),
-                    ),
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        IgnorePointer(
-                          child: Container(
-                            height: 72,
-                            margin: const EdgeInsets.symmetric(horizontal: 12),
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(18),
-                              color: kSleekAccent.withOpacity(.10),
-                              border: Border.all(color: kSleekAccent.withOpacity(.28), width: 1.1),
-                            ),
-                          ),
-                        ),
-                        ListWheelScrollView.useDelegate(
-                          controller: pickerController,
-                          itemExtent: 72,
-                          diameterRatio: 100000,
-                          perspective: 0.0001,
-                          squeeze: 1.0,
-                          physics: const FixedExtentScrollPhysics(),
-                          overAndUnderCenterOpacity: .34,
-                          onSelectedItemChanged: (index) => setModalState(() => selectedIndex = index),
-                          childDelegate: ListWheelChildBuilderDelegate(
-                            childCount: options.length,
-                            builder: (context, index) {
-                              final option = options[index];
-                              final isSelected = index == safeIndex;
-                              return _AppleWheelOptionRow(option: option, selected: isSelected);
-                            },
-                          ),
-                        ),
-                      ],
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Cancel'),
                     ),
                   ),
-                  const SizedBox(height: 12),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 180),
-                    child: Row(
-                      key: ValueKey(selected.id),
-                      children: [
-                        iconBubble(context, selected.iconName, selected.iconColor, size: 40),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            selected.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
-                          ),
-                        ),
-                        Text(
-                          selected.subtitle,
-                          style: Theme.of(context).textTheme.labelMedium?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w800),
-                        ),
-                      ],
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton(
+                      onPressed: () => Navigator.pop(dialogContext, options[safeIndex].id),
+                      child: const Text('Done'),
                     ),
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: OutlinedButton(
-                          onPressed: () => Navigator.pop(sheetContext),
-                          child: const Text('Cancel'),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        flex: 2,
-                        child: FilledButton(
-                          onPressed: () => Navigator.pop(sheetContext, options[safeIndex].id),
-                          child: const Text('Done'),
-                        ),
-                      ),
-                    ],
                   ),
                 ],
               ),
-            ),
-          );
-        },
-      );
-    },
+            ],
+          ),
+        );
+      },
+    ),
   );
 
   pickerController.dispose();
@@ -2942,8 +5035,295 @@ Future<DateTime?> pickDate(BuildContext context, DateTime initial) => showDatePi
 
 Future<TimeOfDay?> pickTime(BuildContext context, TimeOfDay initial) => showTimePicker(context: context, initialTime: initial);
 
+OverlayEntry? _activeKoinlySnackEntry;
+
 void showSnack(BuildContext context, String message) {
-  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  final trimmedMessage = message.trim();
+  if (trimmedMessage.isEmpty) return;
+
+  final overlay = Overlay.maybeOf(context, rootOverlay: true);
+  if (overlay == null) {
+    ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(content: Text(trimmedMessage)));
+    return;
+  }
+
+  _activeKoinlySnackEntry?.remove();
+  _activeKoinlySnackEntry = null;
+
+  late final OverlayEntry entry;
+  entry = OverlayEntry(
+    builder: (overlayContext) => _KoinlyDynamicIslandSnack(
+      message: trimmedMessage,
+      onDismissed: () {
+        if (_activeKoinlySnackEntry == entry) {
+          _activeKoinlySnackEntry = null;
+          entry.remove();
+        }
+      },
+    ),
+  );
+
+  _activeKoinlySnackEntry = entry;
+  overlay.insert(entry);
+}
+
+class _KoinlyDynamicIslandSnack extends StatefulWidget {
+  const _KoinlyDynamicIslandSnack({required this.message, required this.onDismissed});
+
+  final String message;
+  final VoidCallback onDismissed;
+
+  @override
+  State<_KoinlyDynamicIslandSnack> createState() => _KoinlyDynamicIslandSnackState();
+}
+
+class _KoinlyDynamicIslandSnackState extends State<_KoinlyDynamicIslandSnack> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  Timer? _hideTimer;
+
+  bool get _isProblemMessage {
+    final lower = widget.message.toLowerCase();
+    return lower.contains('failed') ||
+        lower.contains('error') ||
+        lower.contains('invalid') ||
+        lower.contains('check') ||
+        lower.contains('missing');
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 620),
+      reverseDuration: const Duration(milliseconds: 260),
+    );
+    _controller.forward();
+    _hideTimer = Timer(const Duration(milliseconds: 3400), () async {
+      if (!mounted) return;
+      await _controller.reverse();
+      if (mounted) widget.onDismissed();
+    });
+  }
+
+  @override
+  void dispose() {
+    _hideTimer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final theme = Theme.of(context);
+    final dark = theme.brightness == Brightness.dark;
+    final maxWidth = math.min(kIsDesktopApp ? 520.0 : 560.0, math.max(280.0, media.size.width - 28));
+    final expandedHeight = widget.message.length > 96 ? 108.0 : widget.message.length > 54 ? 86.0 : 64.0;
+    final topInset = media.padding.top + (kIsDesktopApp ? 14.0 : 8.0);
+
+    return IgnorePointer(
+      child: Material(
+        type: MaterialType.transparency,
+        child: Stack(
+          children: [
+            AnimatedBuilder(
+              animation: _controller,
+              builder: (context, child) {
+                final raw = _controller.value;
+                final t = AppMotion.emphasized.transform(raw);
+                final contentT = (((t - .34) / .66).clamp(0.0, 1.0)).toDouble();
+                final width = ui.lerpDouble(92, maxWidth, t)!;
+                final height = ui.lerpDouble(38, expandedHeight, t)!;
+                final radius = ui.lerpDouble(999, 28, t)!;
+                final y = ui.lerpDouble(-52, 0, t)!;
+                final compactScale = ui.lerpDouble(.72, 1, t)!;
+                final borderOpacity = ui.lerpDouble(.16, .09, t)!;
+                final icon = _isProblemMessage ? Icons.error_rounded : Icons.check_circle_rounded;
+                final iconColor = _isProblemMessage ? kSleekWarning : kSleekAccent;
+
+                return Positioned(
+                  top: topInset + y,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: Transform.scale(
+                      scale: compactScale,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(radius),
+                        child: BackdropFilter(
+                          filter: ui.ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                          child: AnimatedContainer(
+                            duration: const Duration(milliseconds: 80),
+                            curve: Curves.linear,
+                            width: width,
+                            height: height,
+                            decoration: BoxDecoration(
+                              color: dark ? const Color(0xF20A1518) : const Color(0xF20F172A),
+                              borderRadius: BorderRadius.circular(radius),
+                              border: Border.all(color: Colors.white.withOpacity(borderOpacity)),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: Colors.black.withOpacity(dark ? .42 : .24),
+                                  blurRadius: 34,
+                                  offset: const Offset(0, 16),
+                                ),
+                              ],
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(radius),
+                              child: Stack(
+                                fit: StackFit.expand,
+                                children: [
+                                  Align(
+                                    alignment: Alignment.center,
+                                    child: Container(
+                                      width: ui.lerpDouble(34, 0, contentT)!,
+                                      height: ui.lerpDouble(6, 0, contentT)!,
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withOpacity(ui.lerpDouble(.72, 0, contentT)!),
+                                        borderRadius: AppShapes.full,
+                                      ),
+                                    ),
+                                  ),
+                                  Opacity(
+                                    opacity: contentT,
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 14),
+                                      child: Row(
+                                        children: [
+                                          Container(
+                                            width: 38,
+                                            height: 38,
+                                            decoration: BoxDecoration(
+                                              color: iconColor.withOpacity(.18),
+                                              borderRadius: BorderRadius.circular(18),
+                                              border: Border.all(color: iconColor.withOpacity(.22)),
+                                            ),
+                                            child: Icon(icon, color: iconColor, size: 21),
+                                          ),
+                                          const SizedBox(width: 12),
+                                          Expanded(
+                                            child: Text(
+                                              widget.message,
+                                              maxLines: 3,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: theme.textTheme.bodyMedium?.copyWith(
+                                                color: Colors.white,
+                                                fontWeight: FontWeight.w900,
+                                                height: 1.14,
+                                                letterSpacing: -.1,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+
+Future<T?> showKoinlyPopup<T>(
+  BuildContext context, {
+  required Widget child,
+  double maxWidth = 560,
+  double maxHeight = 760,
+  bool barrierDismissible = true,
+}) {
+  return showGeneralDialog<T>(
+    context: context,
+    barrierDismissible: barrierDismissible,
+    barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
+    barrierColor: Colors.black.withOpacity(.62),
+    transitionDuration: AppMotion.medium,
+    pageBuilder: (dialogContext, animation, secondaryAnimation) {
+      return _KoinlyPopupFrame(maxWidth: maxWidth, maxHeight: maxHeight, child: child);
+    },
+    transitionBuilder: (context, animation, secondaryAnimation, child) {
+      final curved = CurvedAnimation(parent: animation, curve: AppMotion.emphasized, reverseCurve: AppMotion.emphasizedAccelerate);
+      return FadeTransition(
+        opacity: curved,
+        child: ScaleTransition(
+          scale: Tween<double>(begin: .94, end: 1).animate(curved),
+          child: SlideTransition(
+            position: Tween<Offset>(begin: const Offset(0, .035), end: Offset.zero).animate(curved),
+            child: child,
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class _KoinlyPopupFrame extends StatelessWidget {
+  const _KoinlyPopupFrame({required this.child, required this.maxWidth, required this.maxHeight});
+
+  final Widget child;
+  final double maxWidth;
+  final double maxHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final media = MediaQuery.of(context);
+    final scheme = Theme.of(context).colorScheme;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    final horizontalInset = media.size.width < 420 ? 12.0 : 20.0;
+    final verticalInset = media.size.height < 720 ? 10.0 : 20.0;
+    final availableWidth = math.max(280.0, media.size.width - (horizontalInset * 2));
+    final availableHeight = math.max(
+      300.0,
+      media.size.height - media.padding.top - media.padding.bottom - media.viewInsets.bottom - (verticalInset * 2),
+    );
+    final resolvedWidth = math.min(maxWidth, availableWidth);
+    final resolvedHeight = math.min(maxHeight, availableHeight);
+
+    return Material(
+      type: MaterialType.transparency,
+      child: SafeArea(
+        child: AnimatedPadding(
+          duration: AppMotion.fast,
+          curve: AppMotion.emphasized,
+          padding: EdgeInsets.fromLTRB(horizontalInset, verticalInset, horizontalInset, verticalInset + media.viewInsets.bottom),
+          child: Align(
+            alignment: Alignment.center,
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: resolvedWidth, maxHeight: resolvedHeight),
+              child: Material(
+                color: dark ? kSleekSurface : scheme.surface,
+                elevation: 18,
+                shadowColor: Colors.black.withOpacity(.45),
+                borderRadius: BorderRadius.circular(media.size.width < 420 ? 30 : 34),
+                clipBehavior: Clip.antiAlias,
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.circular(media.size.width < 420 ? 30 : 34),
+                    border: Border.all(color: dark ? Colors.white.withOpacity(.08) : scheme.outline.withOpacity(.16)),
+                  ),
+                  child: child,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -2966,58 +5346,114 @@ class _OnboardingScreenState extends State<OnboardingScreen> {
     final state = context.watch<AppController>();
     return Scaffold(
       body: SafeArea(
-        child: Column(
-          children: [
-            Expanded(
-              child: PageView(
-                controller: controller,
-                onPageChanged: (value) => setState(() => index = value),
-                children: [
-                  _OnboardingPane(
-                    icon: Icons.account_balance_wallet_rounded,
-                    title: 'Track money without losing detail',
-                    body: 'Accounts, categories, transactions, budgets, loans, analysis, exports, reminders, local backup, and optional online sync are available from the first setup.',
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final desktop = constraints.maxWidth >= 900;
+            final horizontalPadding = desktop ? 32.0 : 20.0;
+            return Column(
+              children: [
+                Expanded(
+                  child: PageView(
+                    controller: controller,
+                    physics: const PageScrollPhysics(parent: ClampingScrollPhysics()),
+                    onPageChanged: (value) => setState(() => index = value),
+                    children: [
+                      _OnboardingPane(
+                        icon: Icons.account_balance_wallet_rounded,
+                        title: 'Track money without losing detail',
+                        body: 'Accounts, categories, transactions, budgets, loans, analysis, exports, reminders, local backup, and optional online sync are available from the first setup.',
+                      ),
+                      CurrencySetupPane(state: state),
+                      AccountSetupPane(state: state),
+                      _OnboardingPane(
+                        icon: Icons.privacy_tip_rounded,
+                        title: 'Private local database',
+                        body: 'Your main finance data is stored locally with SQLite by default. Online sync uploads data only after you configure a Sync ID and PIN in Settings.',
+                      ),
+                    ],
                   ),
-                  CurrencySetupPane(state: state),
-                  AccountSetupPane(state: state),
-                  _OnboardingPane(
-                    icon: Icons.privacy_tip_rounded,
-                    title: 'Private local database',
-                    body: 'Your main finance data is stored locally with SQLite by default. Online sync uploads data only after you configure a Sync ID and PIN in Settings.',
+                ),
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.fromLTRB(horizontalPadding, 16, horizontalPadding, 20),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).scaffoldBackgroundColor.withOpacity(.94),
+                    border: Border(top: BorderSide(color: Theme.of(context).colorScheme.outlineVariant.withOpacity(.55))),
                   ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(20),
-              child: Row(
-                children: [
-                  Row(
-                    children: List.generate(4, (i) => AnimatedContainer(
-                          duration: const Duration(milliseconds: 240),
-                          width: i == index ? 24 : 8,
-                          height: 8,
-                          margin: const EdgeInsets.only(right: 6),
-                          decoration: BoxDecoration(borderRadius: BorderRadius.circular(99), color: i == index ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.outlineVariant),
-                        )),
+                  child: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 780),
+                      child: Row(
+                        children: [
+                          Row(
+                            children: List.generate(4, (i) => AnimatedContainer(
+                                  duration: AppMotion.medium,
+                                  width: i == index ? 24 : 8,
+                                  height: 8,
+                                  margin: const EdgeInsets.only(right: 6),
+                                  decoration: BoxDecoration(borderRadius: BorderRadius.circular(99), color: i == index ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.outlineVariant),
+                                )),
+                          ),
+                          const Spacer(),
+                          if (index > 0)
+                            Padding(
+                              padding: const EdgeInsets.only(right: 10),
+                              child: OutlinedButton(
+                                onPressed: () => controller.previousPage(duration: AppMotion.medium, curve: Curves.easeOutCubic),
+                                child: const Text('Back'),
+                              ),
+                            ),
+                          FilledButton(
+                            onPressed: () async {
+                              if (index < 3) {
+                                await controller.nextPage(duration: AppMotion.medium, curve: Curves.easeOutCubic);
+                              } else {
+                                await state.completeOnboarding();
+                              }
+                            },
+                            child: Text(index < 3 ? 'Next' : 'Start'),
+                          ),
+                        ],
+                      ),
+                    ),
                   ),
-                  const Spacer(),
-                  FilledButton(
-                    onPressed: () async {
-                      if (index < 3) {
-                        controller.nextPage(duration: const Duration(milliseconds: 260), curve: Curves.easeOutCubic);
-                      } else {
-                        await state.completeOnboarding();
-                      }
-                    },
-                    child: Text(index < 3 ? 'Next' : 'Start'),
-                  ),
-                ],
-              ),
-            ),
-          ],
+                ),
+              ],
+            );
+          },
         ),
       ),
+    );
+  }
+}
+
+class OnboardingPageFrame extends StatelessWidget {
+  const OnboardingPageFrame({super.key, required this.child, this.maxWidth = 760});
+
+  final Widget child;
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final desktop = constraints.maxWidth >= 900;
+        final horizontalPadding = desktop ? 40.0 : 24.0;
+        final verticalPadding = desktop ? 32.0 : 24.0;
+        return SingleChildScrollView(
+          physics: optimizedScrollPhysics(context),
+          padding: EdgeInsets.symmetric(horizontal: horizontalPadding, vertical: verticalPadding),
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minHeight: math.max(0, constraints.maxHeight - verticalPadding * 2)),
+            child: Center(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: maxWidth),
+                child: child,
+              ),
+            ),
+          ),
+        );
+      },
     );
   }
 }
@@ -3030,24 +5466,14 @@ class _OnboardingPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(24),
+    return OnboardingPageFrame(
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          Hero(
-            tag: 'app-icon',
-            child: Container(
-              width: 110,
-              height: 110,
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(36),
-                gradient: LinearGradient(colors: [Theme.of(context).colorScheme.primary, Theme.of(context).colorScheme.tertiary]),
-              ),
-              child: Icon(icon, size: 58, color: Colors.white),
-            ),
-          ),
-          const SizedBox(height: 32),
+          const KoinlyAppIcon(size: 112, borderRadius: 36),
+          const SizedBox(height: 28),
+          Icon(icon, size: 34, color: Theme.of(context).colorScheme.primary),
+          const SizedBox(height: 16),
           Text(title, textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900)),
           const SizedBox(height: 16),
           Text(body, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodyLarge),
@@ -3063,12 +5489,12 @@ class CurrencySetupPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ResponsiveContent(
-      padding: const EdgeInsets.all(24),
+    return OnboardingPageFrame(
       child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const SizedBox(height: 80),
+          const KoinlyAppIcon(size: 82, borderRadius: 26),
+          const SizedBox(height: 24),
           Text('Currency setup', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900)),
           const SizedBox(height: 12),
           const Text('Choose how every amount is formatted across accounts, loans, budgets, analysis, and exports.', textAlign: TextAlign.center),
@@ -3086,20 +5512,21 @@ class AccountSetupPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ResponsiveContent(
-      padding: const EdgeInsets.all(24),
+    return OnboardingPageFrame(
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const SizedBox(height: 80),
+          const KoinlyAppIcon(size: 82, borderRadius: 26),
+          const SizedBox(height: 24),
           Text('Accounts are ready', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900)),
           const SizedBox(height: 12),
-          const Text('The app preloads Cash, Card, and Bank Account. You can create, edit, delete, reorder, and configure credit limits later.'),
+          const Text('The app preloads Cash, Card, and Bank Account. You can create, edit, delete, reorder, and configure credit limits later.', textAlign: TextAlign.center),
           const SizedBox(height: 24),
           ...state.accounts.map((a) => Padding(
                 padding: const EdgeInsets.only(bottom: 10),
                 child: AccountTile(account: a, onTap: () => showAccountEditor(context, account: a)),
               )),
-          OutlinedButton.icon(onPressed: () => showAccountEditor(context), icon: const Icon(Icons.add_rounded), label: const Text('Create account')),
+          OutlinedButton.icon(onPressed: () => showAccountEditor(context, allowedTypes: const [AccountType.regular, AccountType.credit]), icon: const Icon(Icons.add_rounded), label: const Text('Create account')),
         ],
       ),
     );
@@ -3120,9 +5547,109 @@ class HomeDashboardScreen extends StatelessWidget {
     final txs = state.filteredTransactions();
     final summary = state.summaryFor(txs);
     final accountBalance = state.totalAccountBalance;
-    final recent = txs.take(5).toList();
     final categoryTotals = state.categoryTotals(CategoryType.expense);
     final topCategories = categoryTotals.entries.toList()..sort((a, b) => b.value.compareTo(a.value));
+
+    final balanceCard = BalanceHeroCard(
+      balance: state.format(accountBalance),
+      income: state.format(summary.income),
+      expense: state.format(summary.expense),
+      subtitle: '${state.accounts.length} accounts total • ${state.activeRange().label} balance ${state.format(summary.balance)}',
+      amountsHidden: state.amountsHidden,
+      onToggleAmounts: state.toggleAmountsHidden,
+    );
+
+    final accountsSection = <Widget>[
+      const SectionHeader('Accounts'),
+      HomeNavigationTile(
+        iconName: 'wallet',
+        iconColor: '#78D8E8',
+        title: 'Accounts',
+        subtitle: '${state.operatingAccounts.length} regular accounts',
+        amount: state.format(state.operatingAccountBalance),
+        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AccountListScreen())),
+      ),
+      const SizedBox(height: 10),
+      HomeNavigationTile(
+        iconName: 'savings',
+        iconColor: '#A6E3A1',
+        title: 'Savings Accounts',
+        subtitle: state.savingAccounts.length == 1 ? '1 savings account' : '${state.savingAccounts.length} savings accounts',
+        amount: state.format(state.savingAccountBalance),
+        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AccountListScreen(filterType: AccountType.savings, title: 'Savings Accounts'))),
+      ),
+    ];
+
+    final budgetSection = <Widget>[
+      SectionHeader('Budgets', trailing: TextButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BudgetListScreen())), child: const Text('View all'))),
+      if (state.budgets.isEmpty)
+        EmptyCard(icon: Icons.savings_rounded, title: 'No budget yet', body: 'Create a monthly budget and track spending against limits.', action: () => showBudgetEditor(context), actionLabel: 'Create budget')
+      else
+        ...state.budgetProgress().take(2).map((b) => Padding(padding: const EdgeInsets.only(bottom: 10), child: BudgetProgressTile(progress: b))),
+    ];
+
+
+    final overdueLoanSection = <Widget>[
+      if (state.overdueLoanReminders.isNotEmpty) ...[
+        const SectionHeader('Loan alerts'),
+        GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () {
+            final reminder = state.overdueLoanReminders.firstOrNull;
+            final loan = reminder == null ? null : state.loanOf(reminder.loanId);
+            if (loan != null) {
+              state.activeLoanType = loan.type;
+            }
+            state.tabIndex = 2;
+            state.notifyListeners();
+          },
+          child: ExpressiveCard(
+            color: Theme.of(context).brightness == Brightness.dark ? const Color(0xFF2A1719) : const Color(0xFFFFF0F0),
+            child: Row(
+              children: [
+                iconBubble(context, 'warning', '#FF5353', size: 50),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('${state.overdueLoanReminders.length} overdue loan repayment${state.overdueLoanReminders.length == 1 ? '' : 's'}', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+                      const SizedBox(height: 4),
+                      Text('Open Loan Tracking to mark repayments as paid.', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+                const Icon(Icons.chevron_right_rounded),
+              ],
+            ),
+          ),
+        ),
+      ],
+    ];
+
+    final categorySection = <Widget>[
+      SectionHeader('Category spending'),
+      if (topCategories.isEmpty)
+        const EmptyCard(icon: Icons.pie_chart_rounded, title: 'No spending data', body: 'Add expenses to see where money is going.')
+      else
+        ExpressiveCard(
+          child: Column(
+            children: topCategories.take(4).map((entry) {
+              final category = state.categoryOf(entry.key);
+              final total = categoryTotals.values.fold<double>(0, (s, v) => s + v);
+              return ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: category == null ? null : iconBubble(context, category.iconName, category.iconColor),
+                title: Text(category?.name ?? 'Unknown'),
+                subtitle: LinearProgressIndicator(value: total <= 0 ? 0 : entry.value / total),
+                trailing: Text(state.format(entry.value), style: const TextStyle(fontWeight: FontWeight.w800)),
+                onTap: category == null ? null : () => Navigator.push(context, MaterialPageRoute(builder: (_) => CategoryTransactionScreen(category: category))),
+              );
+            }).toList(),
+          ),
+        ),
+    ];
+
 
     return PageScaffold(
       title: 'Home',
@@ -3132,49 +5659,98 @@ class HomeDashboardScreen extends StatelessWidget {
         IconButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const SettingsScreen())), icon: const Icon(Icons.settings_rounded)),
       ],
       child: ResponsiveContent(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            BalanceHeroCard(
-              balance: state.format(accountBalance),
-              income: state.format(summary.income),
-              expense: state.format(summary.expense),
-              subtitle: '${state.accounts.length} accounts total • ${state.activeRange().label} balance ${state.format(summary.balance)}',
-            ),
-            SectionHeader('Accounts', trailing: TextButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AccountListScreen())), child: const Text('View all'))),
-            ...state.accounts.take(3).map((account) => Padding(padding: const EdgeInsets.only(bottom: 10), child: AccountTile(account: account, onTap: () => showAccountEditor(context, account: account)))),
-            SectionHeader('Budgets', trailing: TextButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const BudgetListScreen())), child: const Text('View all'))),
-            if (state.budgets.isEmpty)
-              EmptyCard(icon: Icons.savings_rounded, title: 'No budget yet', body: 'Create a monthly budget and track spending against limits.', action: () => showBudgetEditor(context), actionLabel: 'Create budget')
-            else
-              ...state.budgetProgress().take(2).map((b) => Padding(padding: const EdgeInsets.only(bottom: 10), child: BudgetProgressTile(progress: b))),
-            SectionHeader('Category spending'),
-            if (topCategories.isEmpty)
-              const EmptyCard(icon: Icons.pie_chart_rounded, title: 'No spending data', body: 'Add expenses to see where money is going.')
-            else
-              ExpressiveCard(
-                child: Column(
-                  children: topCategories.take(4).map((entry) {
-                    final category = state.categoryOf(entry.key);
-                    final total = categoryTotals.values.fold<double>(0, (s, v) => s + v);
-                    return ListTile(
-                      contentPadding: EdgeInsets.zero,
-                      leading: category == null ? null : iconBubble(context, category.iconName, category.iconColor),
-                      title: Text(category?.name ?? 'Unknown'),
-                      subtitle: LinearProgressIndicator(value: total <= 0 ? 0 : entry.value / total),
-                      trailing: Text(state.format(entry.value), style: const TextStyle(fontWeight: FontWeight.w800)),
-                      onTap: category == null ? null : () => Navigator.push(context, MaterialPageRoute(builder: (_) => CategoryTransactionScreen(category: category))),
-                    );
-                  }).toList(),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final useDesktopColumns = constraints.maxWidth >= 860;
+            if (!useDesktopColumns) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  balanceCard,
+                  ...overdueLoanSection,
+                  ...accountsSection,
+                  ...budgetSection,
+                  ...categorySection,
+                ],
+              );
+            }
+
+            return Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  flex: 5,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      balanceCard,
+                      ...overdueLoanSection,
+                      ...accountsSection,
+                      ...budgetSection,
+                    ],
+                  ),
                 ),
-              ),
-            SectionHeader('Recent transactions', trailing: TextButton(onPressed: () { state.tabIndex = 3; state.notifyListeners(); }, child: const Text('View all'))),
-            if (recent.isEmpty)
-              EmptyCard(icon: Icons.receipt_long_rounded, title: 'No transactions', body: 'Use the quick add button to create income, expense, or transfer records.', action: () => showTransactionEditor(context), actionLabel: 'Add transaction')
-            else
-              ...recent.map((tx) => Padding(padding: const EdgeInsets.only(bottom: 10), child: TransactionTile(tx: tx))),
+                const SizedBox(width: 18),
+                Expanded(
+                  flex: 4,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      ...categorySection,
+                        ],
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+
+class HomeNavigationTile extends StatelessWidget {
+  const HomeNavigationTile({
+    super.key,
+    required this.iconName,
+    required this.iconColor,
+    required this.title,
+    required this.subtitle,
+    required this.amount,
+    required this.onTap,
+  });
+
+  final String iconName;
+  final String iconColor;
+  final String title;
+  final String subtitle;
+  final String amount;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return ExpressiveCard(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: ListTile(
+        contentPadding: EdgeInsets.zero,
+        leading: iconBubble(context, iconName, iconColor, size: 50),
+        title: Text(title, style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+        subtitle: Text(
+          subtitle,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(amount, style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900)),
+            const SizedBox(width: 6),
+            Icon(Icons.chevron_right_rounded, color: Theme.of(context).colorScheme.onSurfaceVariant),
           ],
         ),
+        onTap: onTap,
       ),
     );
   }
@@ -3270,11 +5846,21 @@ class MiniMetric extends StatelessWidget {
 }
 
 class BalanceHeroCard extends StatelessWidget {
-  const BalanceHeroCard({super.key, required this.balance, required this.income, required this.expense, required this.subtitle});
+  const BalanceHeroCard({
+    super.key,
+    required this.balance,
+    required this.income,
+    required this.expense,
+    required this.subtitle,
+    required this.amountsHidden,
+    required this.onToggleAmounts,
+  });
   final String balance;
   final String income;
   final String expense;
   final String subtitle;
+  final bool amountsHidden;
+  final VoidCallback onToggleAmounts;
 
   @override
   Widget build(BuildContext context) {
@@ -3308,10 +5894,12 @@ class BalanceHeroCard extends StatelessWidget {
                 ],
               ),
         border: Border.all(color: dark ? kSleekAccent.withOpacity(.18) : scheme.outline.withOpacity(.16), width: 1),
-        boxShadow: [
-          BoxShadow(color: kSleekAccent.withOpacity(dark ? .10 : .08), blurRadius: 28, offset: const Offset(0, 14)),
-          BoxShadow(color: Colors.black.withOpacity(dark ? .30 : .08), blurRadius: 22, offset: const Offset(0, 12)),
-        ],
+        boxShadow: kIsDesktopApp
+            ? null
+            : [
+                BoxShadow(color: kSleekAccent.withOpacity(dark ? .08 : .05), blurRadius: 18, offset: const Offset(0, 9)),
+                BoxShadow(color: Colors.black.withOpacity(dark ? .22 : .055), blurRadius: 16, offset: const Offset(0, 8)),
+              ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -3320,11 +5908,32 @@ class BalanceHeroCard extends StatelessWidget {
             children: [
               Text('Net Balance', style: Theme.of(context).textTheme.labelLarge?.copyWith(color: titleColor, fontWeight: FontWeight.w800)),
               const SizedBox(width: 6),
-              Icon(Icons.visibility_rounded, size: 15, color: dark ? const Color(0xFF9EDDE7) : kSleekAccent.withOpacity(.82)),
+              Tooltip(
+                message: amountsHidden ? 'Show amounts' : 'Hide amounts',
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(999),
+                  onTap: onToggleAmounts,
+                  child: Padding(
+                    padding: const EdgeInsets.all(3),
+                    child: Icon(
+                      amountsHidden ? Icons.visibility_off_rounded : Icons.visibility_rounded,
+                      size: 16,
+                      color: dark ? const Color(0xFF9EDDE7) : kSleekAccent.withOpacity(.82),
+                    ),
+                  ),
+                ),
+              ),
             ],
           ),
           const SizedBox(height: 10),
-          Text(balance, style: Theme.of(context).textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w900, letterSpacing: -1.2, color: valueColor)),
+          SizedBox(
+            width: double.infinity,
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(balance, maxLines: 1, softWrap: false, style: Theme.of(context).textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w900, letterSpacing: -1.2, color: valueColor)),
+            ),
+          ),
           const SizedBox(height: 7),
           Text(subtitle, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: subtitleColor, fontWeight: FontWeight.w700)),
           const SizedBox(height: 18),
@@ -3358,9 +5967,10 @@ class _DecorativeSparkline extends StatelessWidget {
       FlSpot(6, 2.9),
       FlSpot(7, 4.0),
     ];
-    return SizedBox(
-      height: 54,
-      child: LineChart(
+    return RepaintBoundary(
+      child: SizedBox(
+        height: 54,
+        child: LineChart(
         LineChartData(
           minX: 0,
           maxX: 7,
@@ -3388,6 +5998,7 @@ class _DecorativeSparkline extends StatelessWidget {
               ),
             ),
           ],
+        ),
         ),
       ),
     );
@@ -3441,7 +6052,11 @@ class AccountTile extends StatelessWidget {
         leading: iconBubble(context, account.iconName, account.iconColor, size: 46),
         title: Text(account.name, style: const TextStyle(fontWeight: FontWeight.w900)),
         subtitle: Text(
-          account.type == AccountType.credit ? 'Credit • Available ${state.format(account.availableCredit)}' : 'Cash Wallet',
+          account.type == AccountType.credit
+              ? 'Credit • Available ${state.format(account.availableCredit)}'
+              : account.type == AccountType.savings
+                  ? 'Savings Account'
+                  : 'Cash Wallet',
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
           style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
@@ -3462,26 +6077,509 @@ class AccountTile extends StatelessWidget {
 
 
 class AccountListScreen extends StatelessWidget {
-  const AccountListScreen({super.key});
+  const AccountListScreen({super.key, this.filterType, this.title = 'Accounts'});
+
+  final AccountType? filterType;
+  final String title;
+
+  bool _matches(Account account) {
+    if (filterType == AccountType.savings) return account.type == AccountType.savings;
+    return account.type != AccountType.savings;
+  }
+
+  AccountType get _initialType => filterType == AccountType.savings ? AccountType.savings : AccountType.regular;
+  List<AccountType> get _allowedTypes => filterType == AccountType.savings
+      ? const [AccountType.savings]
+      : const [AccountType.regular, AccountType.credit];
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
+    final visibleAccounts = state.accounts.where(_matches).toList();
+    final emptyTitle = filterType == AccountType.savings ? 'No savings accounts' : 'No accounts';
+    final emptyBody = filterType == AccountType.savings
+        ? 'Create a savings account. Balance changes here do not create income, expense, or transaction history.'
+        : 'Create your first account to start tracking money.';
+    final empty = EmptyCard(
+      icon: filterType == AccountType.savings ? Icons.savings_rounded : Icons.account_balance_wallet_rounded,
+      title: emptyTitle,
+      body: emptyBody,
+      action: () => showAccountEditor(context, initialType: _initialType, allowedTypes: _allowedTypes),
+      actionLabel: filterType == AccountType.savings ? 'Add savings account' : 'Add account',
+    );
+
     return PageScaffold(
-      title: 'Accounts',
+      title: title,
       actions: [
-        IconButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AccountReorderScreen())), icon: const Icon(Icons.swap_vert_rounded)),
-        IconButton(onPressed: () => showAccountEditor(context), icon: const Icon(Icons.add_rounded)),
+        IconButton(onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => AccountReorderScreen(filterType: filterType))), icon: const Icon(Icons.swap_vert_rounded)),
+        IconButton(onPressed: () => showAccountEditor(context, initialType: _initialType, allowedTypes: _allowedTypes), icon: const Icon(Icons.add_rounded)),
       ],
-      child: ResponsiveContent(
-        child: Column(children: state.accounts.map((account) => Padding(padding: const EdgeInsets.only(bottom: 10), child: AccountTile(account: account, onTap: () => showAccountEditor(context, account: account)))).toList()),
+      child: filterType == AccountType.savings
+          ? SavingsAccountsContent(accounts: visibleAccounts, empty: empty, allowedTypes: _allowedTypes)
+          : ResponsiveListContent(
+              itemCount: visibleAccounts.length,
+              empty: empty,
+              itemBuilder: (context, index) {
+                final account = visibleAccounts[index];
+                return AccountTile(account: account, onTap: () => showAccountEditor(context, account: account, allowedTypes: _allowedTypes));
+              },
+            ),
+    );
+  }
+}
+
+
+class SavingsAccountsContent extends StatefulWidget {
+  const SavingsAccountsContent({super.key, required this.accounts, required this.empty, required this.allowedTypes});
+
+  final List<Account> accounts;
+  final Widget empty;
+  final List<AccountType> allowedTypes;
+
+  @override
+  State<SavingsAccountsContent> createState() => _SavingsAccountsContentState();
+}
+
+class _SavingsAccountsContentState extends State<SavingsAccountsContent> {
+  bool _profilePromptScheduled = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final state = context.read<AppController>();
+    if (!_profilePromptScheduled && !state.savingsSuggestionProfile.completed) {
+      _profilePromptScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        if (!mounted) return;
+        await showSavingsSuggestionProfileSheet(context, firstRun: true);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        ResponsiveContent(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              if (widget.accounts.isEmpty)
+                widget.empty
+              else
+                ...widget.accounts.map(
+                  (account) => Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: AccountTile(account: account, onTap: () => showAccountEditor(context, account: account, allowedTypes: widget.allowedTypes)),
+                  ),
+                ),
+              if (widget.accounts.isNotEmpty) const SizedBox(height: 420),
+            ],
+          ),
+        ),
+        if (widget.accounts.isNotEmpty) const Positioned.fill(child: SavingsSuggestionPanel()),
+      ],
+    );
+  }
+}
+
+class SavingsSuggestionPanel extends StatefulWidget {
+  const SavingsSuggestionPanel({super.key});
+
+  @override
+  State<SavingsSuggestionPanel> createState() => _SavingsSuggestionPanelState();
+}
+
+class _SavingsSuggestionPanelState extends State<SavingsSuggestionPanel> with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+  final math.Random _random = math.Random();
+  Timer? _cycleTimer;
+  String? _poppedId;
+  SavingsPurchaseSuggestion? _visibleSuggestion;
+  bool _bubbleVisible = false;
+  double _horizontalFactor = .5;
+  double _verticalFactor = .5;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 2600))..repeat(reverse: true);
+    _scheduleNextAppearance(initial: true);
+  }
+
+  @override
+  void dispose() {
+    _cycleTimer?.cancel();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _scheduleNextAppearance({bool initial = false}) {
+    _cycleTimer?.cancel();
+    final delay = initial ? const Duration(milliseconds: 550) : Duration(milliseconds: 900 + _random.nextInt(1700));
+    _cycleTimer = Timer(delay, _showRandomBubble);
+  }
+
+  void _showRandomBubble() {
+    if (!mounted) return;
+    final suggestions = context.read<AppController>().unseenSavingsPurchaseSuggestionsForToday();
+    if (suggestions.isEmpty) {
+      setState(() {
+        _bubbleVisible = false;
+        _visibleSuggestion = null;
+      });
+      return;
+    }
+
+    final suggestion = suggestions[_random.nextInt(suggestions.length)];
+    setState(() {
+      _visibleSuggestion = suggestion;
+      _bubbleVisible = true;
+      _horizontalFactor = _random.nextDouble();
+      _verticalFactor = _random.nextDouble();
+    });
+
+    _cycleTimer = Timer(Duration(milliseconds: 3200 + _random.nextInt(1900)), () {
+      if (!mounted) return;
+      setState(() => _bubbleVisible = false);
+      _scheduleNextAppearance();
+    });
+  }
+
+  Future<void> _popBubble(SavingsPurchaseSuggestion suggestion) async {
+    _cycleTimer?.cancel();
+    setState(() => _poppedId = suggestion.id);
+    unawaited(HapticFeedback.mediumImpact());
+    unawaited(SystemSound.play(SystemSoundType.click));
+    await Future<void>.delayed(const Duration(milliseconds: 135));
+    if (!mounted) return;
+    await showKoinlyPopup<void>(
+      context,
+      maxWidth: 520,
+      maxHeight: 620,
+      child: SavingsSuggestionDetailDialog(suggestion: suggestion),
+    );
+    if (!mounted) return;
+    await context.read<AppController>().markSavingsSuggestionSeenToday(suggestion.id);
+    if (!mounted) return;
+    setState(() {
+      _poppedId = null;
+      _bubbleVisible = false;
+      _visibleSuggestion = null;
+    });
+    if (context.read<AppController>().unseenSavingsPurchaseSuggestionsForToday().isNotEmpty) {
+      _scheduleNextAppearance();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppController>();
+    final unseenSuggestions = state.unseenSavingsPurchaseSuggestionsForToday();
+    if (unseenSuggestions.isEmpty) return const SizedBox.shrink();
+
+    final visibleSuggestion = _visibleSuggestion;
+    if (visibleSuggestion == null || !unseenSuggestions.any((suggestion) => suggestion.id == visibleSuggestion.id)) {
+      return const SizedBox.shrink();
+    }
+
+    return RepaintBoundary(
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          final height = constraints.maxHeight;
+          final bubbleSize = width < 390 ? 66.0 : 74.0;
+          final leftSafe = width < 390 ? 18.0 : 28.0;
+          final rightSafe = width < 390 ? 18.0 : 28.0;
+          final topStart = math.max(165.0, math.min(height * .24, 235.0));
+          final availableWidth = math.max(1.0, width - leftSafe - rightSafe - bubbleSize);
+          final availableHeight = math.max(220.0, height - topStart - 96.0);
+          final wave = math.sin((_controller.value * math.pi * 2) + 1.35);
+          final drift = math.cos((_controller.value * math.pi * 2) + .9);
+          final baseLeft = leftSafe + (availableWidth * _horizontalFactor);
+          final baseTop = topStart + (availableHeight * _verticalFactor);
+          final left = math.min(math.max(leftSafe, baseLeft + (wave * 14)), width - rightSafe - bubbleSize);
+          final top = math.min(math.max(112.0, baseTop + (drift * 12)), height - 105);
+
+          return Stack(
+            clipBehavior: Clip.none,
+            children: [
+              Positioned(
+                left: left,
+                top: top,
+                child: IgnorePointer(
+                  ignoring: !_bubbleVisible,
+                  child: AnimatedOpacity(
+                    opacity: _bubbleVisible ? 1 : 0,
+                    duration: AppMotion.fast,
+                    curve: AppMotion.emphasized,
+                    child: AnimatedScale(
+                      scale: _bubbleVisible ? 1 : .78,
+                      duration: AppMotion.fast,
+                      curve: AppMotion.emphasized,
+                      child: _SavingsSuggestionBubble(
+                        suggestion: visibleSuggestion,
+                        selected: _poppedId == visibleSuggestion.id,
+                        onTap: () => _popBubble(visibleSuggestion),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _SavingsSuggestionBubble extends StatelessWidget {
+  const _SavingsSuggestionBubble({required this.suggestion, required this.selected, required this.onTap});
+
+  final SavingsPurchaseSuggestion suggestion;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = colorFromHex(suggestion.color, fallback: kSleekAccent);
+    final scheme = Theme.of(context).colorScheme;
+    final dark = Theme.of(context).brightness == Brightness.dark;
+
+    return AnimatedScale(
+      scale: selected ? .82 : 1,
+      duration: AppMotion.fast,
+      curve: AppMotion.emphasized,
+      child: GestureDetector(
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: AppMotion.fast,
+          width: 74,
+          height: 74,
+          decoration: BoxDecoration(
+            color: selected ? color.withOpacity(.30) : (dark ? const Color(0xEE10191D) : Colors.white.withOpacity(.96)),
+            shape: BoxShape.circle,
+            border: Border.all(color: selected ? color.withOpacity(.78) : color.withOpacity(.36), width: selected ? 2 : 1.2),
+            boxShadow: [
+              BoxShadow(color: color.withOpacity(selected ? .42 : .26), blurRadius: selected ? 30 : 22, offset: const Offset(0, 10)),
+              BoxShadow(color: Colors.black.withOpacity(dark ? .28 : .10), blurRadius: 18, offset: const Offset(0, 12)),
+            ],
+          ),
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              Container(
+                width: 46,
+                height: 46,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: color.withOpacity(.16),
+                  border: Border.all(color: scheme.outline.withOpacity(dark ? .10 : .20)),
+                ),
+              ),
+              Text(
+                '?',
+                style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                      color: color,
+                      fontWeight: FontWeight.w900,
+                      height: 1,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class SavingsSuggestionDetailDialog extends StatelessWidget {
+  const SavingsSuggestionDetailDialog({super.key, required this.suggestion});
+
+  final SavingsPurchaseSuggestion suggestion;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = colorFromHex(suggestion.color, fallback: kSleekAccent);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 20, 18, 16),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            iconBubble(context, suggestion.iconName, suggestion.color, size: 58),
+            const SizedBox(height: 14),
+            Text(suggestion.title, textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 12),
+            _SuggestionDetailRow(icon: Icons.price_change_rounded, title: 'Estimated cost', body: suggestion.costRange, color: color),
+            _SuggestionDetailRow(icon: Icons.psychology_rounded, title: 'Why this fits', body: suggestion.reason, color: color),
+            _SuggestionDetailRow(icon: Icons.savings_rounded, title: 'Savings fit', body: suggestion.savingsFit, color: color),
+            const SizedBox(height: 8),
+            Text('This is an optional spending idea, not financial advice. Only buy if it fits your actual needs and savings goal.', textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 18),
+            FilledButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Dismiss'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SuggestionDetailRow extends StatelessWidget {
+  const _SuggestionDetailRow({required this.icon, required this.title, required this.body, required this.color});
+
+  final IconData icon;
+  final String title;
+  final String body;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHigh.withOpacity(.52),
+          borderRadius: BorderRadius.circular(18),
+          border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(.12)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: color, size: 22),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title, style: Theme.of(context).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w900)),
+                  const SizedBox(height: 3),
+                  Text(body, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant, fontWeight: FontWeight.w700)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> showSavingsSuggestionProfileSheet(BuildContext context, {bool firstRun = false}) async {
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 720,
+    barrierDismissible: !firstRun,
+    child: SavingsSuggestionProfileEditor(firstRun: firstRun),
+  );
+}
+
+class SavingsSuggestionProfileEditor extends StatefulWidget {
+  const SavingsSuggestionProfileEditor({super.key, this.firstRun = false});
+
+  final bool firstRun;
+
+  @override
+  State<SavingsSuggestionProfileEditor> createState() => _SavingsSuggestionProfileEditorState();
+}
+
+class _SavingsSuggestionProfileEditorState extends State<SavingsSuggestionProfileEditor> {
+  final hobby = TextEditingController();
+  final occupation = TextEditingController();
+  final age = TextEditingController();
+  final goal = TextEditingController();
+  final preference = TextEditingController();
+  final extra = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    final profile = context.read<AppController>().savingsSuggestionProfile;
+    hobby.text = profile.hobby;
+    occupation.text = profile.occupation;
+    age.text = profile.age <= 0 ? '' : '${profile.age}';
+    goal.text = profile.savingsGoal;
+    preference.text = profile.spendingPreference;
+    extra.text = profile.extraDetails;
+  }
+
+  @override
+  void dispose() {
+    hobby.dispose();
+    occupation.dispose();
+    age.dispose();
+    goal.dispose();
+    preference.dispose();
+    extra.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save({bool skip = false}) async {
+    final profile = skip
+        ? SavingsSuggestionProfile.empty.copyWith(completed: true, updatedOn: DateTime.now())
+        : SavingsSuggestionProfile(
+            completed: true,
+            hobby: hobby.text.trim(),
+            occupation: occupation.text.trim(),
+            age: int.tryParse(age.text.trim()) ?? 0,
+            savingsGoal: goal.text.trim(),
+            spendingPreference: preference.text.trim(),
+            extraDetails: extra.text.trim(),
+            updatedOn: DateTime.now(),
+          );
+    await context.read<AppController>().saveSavingsSuggestionProfile(profile);
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 20, 18, 16),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(widget.firstRun ? 'Savings suggestion profile' : 'Edit suggestion profile', textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 8),
+            Text('Used only to personalize optional purchase ideas. Savings transfers remain internal and do not count as income or expense.', textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 16),
+            TextField(controller: hobby, decoration: const InputDecoration(labelText: 'Hobby', hintText: 'Gaming, anime, reading, travel...')),
+            const SizedBox(height: 10),
+            TextField(controller: occupation, decoration: const InputDecoration(labelText: 'Occupation', hintText: 'Student, worker, creator...')),
+            const SizedBox(height: 10),
+            TextField(controller: age, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Age')),
+            const SizedBox(height: 10),
+            TextField(controller: goal, decoration: const InputDecoration(labelText: 'Savings goal', hintText: 'Emergency fund, phone, PC, trip...')),
+            const SizedBox(height: 10),
+            TextField(controller: preference, decoration: const InputDecoration(labelText: 'Spending preference', hintText: 'Careful, balanced, hobby-first...')),
+            const SizedBox(height: 10),
+            TextField(controller: extra, minLines: 2, maxLines: 3, decoration: const InputDecoration(labelText: 'Other details optional')),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(child: OutlinedButton(onPressed: () => _save(skip: true), child: Text(widget.firstRun ? 'Skip' : 'Reset'))),
+                const SizedBox(width: 10),
+                Expanded(flex: 2, child: FilledButton(onPressed: _save, child: const Text('Save profile'))),
+              ],
+            ),
+          ],
+        ),
       ),
     );
   }
 }
 
 class AccountReorderScreen extends StatefulWidget {
-  const AccountReorderScreen({super.key});
+  const AccountReorderScreen({super.key, this.filterType});
+  final AccountType? filterType;
 
   @override
   State<AccountReorderScreen> createState() => _AccountReorderScreenState();
@@ -3490,16 +6588,21 @@ class AccountReorderScreen extends StatefulWidget {
 class _AccountReorderScreenState extends State<AccountReorderScreen> {
   late List<Account> items;
 
+  bool _matches(Account account) {
+    if (widget.filterType == AccountType.savings) return account.type == AccountType.savings;
+    return account.type != AccountType.savings;
+  }
+
   @override
   void initState() {
     super.initState();
-    items = List.of(context.read<AppController>().accounts);
+    items = context.read<AppController>().accounts.where(_matches).toList();
   }
 
   @override
   Widget build(BuildContext context) {
     return PageScaffold(
-      title: 'Reorder accounts',
+      title: widget.filterType == AccountType.savings ? 'Reorder savings accounts' : 'Reorder accounts',
       actions: [
         IconButton(
           onPressed: () async {
@@ -3529,18 +6632,25 @@ class _AccountReorderScreenState extends State<AccountReorderScreen> {
   }
 }
 
-Future<void> showAccountEditor(BuildContext context, {Account? account}) async {
-  await showModalBottomSheet(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    builder: (_) => AccountEditor(account: account),
+Future<void> showAccountEditor(
+  BuildContext context, {
+  Account? account,
+  AccountType initialType = AccountType.regular,
+  List<AccountType>? allowedTypes,
+}) async {
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 720,
+    child: AccountEditor(account: account, initialType: initialType, allowedTypes: allowedTypes),
   );
 }
 
 class AccountEditor extends StatefulWidget {
-  const AccountEditor({super.key, this.account});
+  const AccountEditor({super.key, this.account, this.initialType = AccountType.regular, this.allowedTypes});
   final Account? account;
+  final AccountType initialType;
+  final List<AccountType>? allowedTypes;
 
   @override
   State<AccountEditor> createState() => _AccountEditorState();
@@ -3554,6 +6664,21 @@ class _AccountEditorState extends State<AccountEditor> {
   String icon = 'wallet';
   String color = '#78D8E8';
 
+  List<AccountType> get allowedTypes => widget.allowedTypes ?? AccountType.values;
+
+  List<SleekPillOption<AccountType>> get _typeOptions {
+    return allowedTypes.map((accountType) {
+      switch (accountType) {
+        case AccountType.regular:
+          return const SleekPillOption(value: AccountType.regular, label: 'Regular', icon: Icons.account_balance_wallet_rounded);
+        case AccountType.credit:
+          return const SleekPillOption(value: AccountType.credit, label: 'Credit', icon: Icons.credit_card_rounded);
+        case AccountType.savings:
+          return const SleekPillOption(value: AccountType.savings, label: 'Savings', icon: Icons.savings_rounded);
+      }
+    }).toList();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -3562,9 +6687,16 @@ class _AccountEditorState extends State<AccountEditor> {
       name.text = a.name;
       amount.text = a.amount.toStringAsFixed(2);
       creditLimit.text = a.creditLimit.toStringAsFixed(2);
-      type = a.type;
+      type = allowedTypes.contains(a.type) ? a.type : allowedTypes.first;
       icon = a.iconName;
       color = a.iconColor;
+    } else {
+      type = allowedTypes.contains(widget.initialType) ? widget.initialType : allowedTypes.first;
+      if (type == AccountType.savings) {
+        name.text = 'Savings Account';
+        icon = 'savings';
+        color = '#A6E3A1';
+      }
     }
   }
 
@@ -3572,7 +6704,7 @@ class _AccountEditorState extends State<AccountEditor> {
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -3583,15 +6715,25 @@ class _AccountEditorState extends State<AccountEditor> {
             TextField(controller: name, decoration: const InputDecoration(labelText: 'Account name')),
             const SizedBox(height: 12),
             SleekPillSelector<AccountType>(
-              options: const [
-                SleekPillOption(value: AccountType.regular, label: 'Regular', icon: Icons.account_balance_wallet_rounded),
-                SleekPillOption(value: AccountType.credit, label: 'Credit', icon: Icons.credit_card_rounded),
-              ],
+              options: _typeOptions,
               selected: type,
-              onChanged: (v) => setState(() => type = v),
+              onChanged: (v) => setState(() {
+                type = v;
+                if (v == AccountType.savings && icon == 'wallet') {
+                  icon = 'savings';
+                  color = '#A6E3A1';
+                }
+              }),
             ),
             const SizedBox(height: 12),
             TextField(controller: amount, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Balance')),
+            if (type == AccountType.savings) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Changing this balance updates total accounts only. It does not create income, expense, or transaction history.',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+              ),
+            ],
             if (type == AccountType.credit) ...[
               const SizedBox(height: 12),
               TextField(controller: creditLimit, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Credit limit')),
@@ -3648,7 +6790,7 @@ class IconColorPicker extends StatelessWidget {
     'wallet', 'credit_card', 'bank', 'savings', 'cash', 'atm', 'receipt', 'calculator',
     'apparel', 'shopping_bag', 'cart', 'store', 'food', 'groceries', 'coffee', 'fastfood',
     'health', 'hospital', 'medicine', 'favorite', 'leisure', 'games', 'movie', 'music',
-    'sports', 'fitness', 'book', 'school', 'car', 'bus', 'train', 'flight', 'fuel',
+    'sports', 'fitness', 'book', 'school', 'car', 'bus', 'train', 'flight', 'origami_bird', 'anime', 'manga', 'collectibles', 'headphones', 'keyboard', 'laptop', 'monitor', 'mic', 'video', 'art', 'subscription', 'fuel',
     'home', 'house', 'apartment', 'utilities', 'water', 'wifi', 'phone', 'bolt',
     'gift', 'celebration', 'travel', 'pets', 'baby', 'beauty', 'salary', 'work',
     'business', 'investment', 'money', 'exchange', 'coupon', 'handshake', 'donation',
@@ -3798,7 +6940,7 @@ class _IconPreviewDot extends StatelessWidget {
       width: 54,
       height: 54,
       decoration: BoxDecoration(color: c, shape: BoxShape.circle),
-      child: Icon(iconFor(icon), color: Colors.white, size: 30),
+      child: Center(child: iconGlyph(context, icon, color: Colors.white, size: 30, imageBackground: Colors.white.withOpacity(.92))),
     );
   }
 }
@@ -3817,68 +6959,62 @@ class ColorSelectionPage extends StatelessWidget {
   Future<String?> _showCustomColorOptions(BuildContext context) async {
     final initial = _normalizeColor(selectedColor).isEmpty ? '#78D8E8' : _normalizeColor(selectedColor);
 
-    final choice = await showModalBottomSheet<String>(
-      context: context,
-      backgroundColor: Colors.transparent,
-      isScrollControlled: true,
-      builder: (sheetContext) {
-        return SafeArea(
-          top: false,
-          child: Container(
-            margin: const EdgeInsets.all(12),
+    final choice = await showKoinlyPopup<String>(
+      context,
+      maxWidth: 460,
+      maxHeight: 420,
+      child: Builder(
+        builder: (dialogContext) {
+          final dark = Theme.of(dialogContext).brightness == Brightness.dark;
+          final handleColor = dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE);
+          return SingleChildScrollView(
             padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-            decoration: BoxDecoration(
-              color: Theme.of(sheetContext).brightness == Brightness.dark ? kSleekSurface : Colors.white,
-              borderRadius: BorderRadius.circular(28),
-              border: Border.all(color: Theme.of(sheetContext).brightness == Brightness.dark ? const Color(0xFF24343A) : const Color(0xFFDCE8EB)),
-              boxShadow: [BoxShadow(color: Colors.black.withOpacity(.45), blurRadius: 28, offset: const Offset(0, -8))],
-            ),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
                   width: 44,
                   height: 5,
-                  decoration: BoxDecoration(color: Theme.of(sheetContext).brightness == Brightness.dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE), borderRadius: BorderRadius.circular(999)),
+                  decoration: BoxDecoration(color: handleColor, borderRadius: BorderRadius.circular(999)),
                 ),
                 const SizedBox(height: 18),
                 Text(
                   'Custom color',
-                  style: Theme.of(sheetContext).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
+                  style: Theme.of(dialogContext).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
                 ),
                 const SizedBox(height: 6),
                 Text(
                   'Choose how you want to create a custom color.',
                   textAlign: TextAlign.center,
-                  style: Theme.of(sheetContext).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+                  style: Theme.of(dialogContext).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
                 ),
                 const SizedBox(height: 16),
                 _CustomColorOptionCard(
                   icon: Icons.palette_rounded,
                   title: 'Color picker',
                   subtitle: 'Use color wheel, brightness, and HEX input',
-                  onTap: () => Navigator.pop(sheetContext, 'wheel'),
+                  onTap: () => Navigator.pop(dialogContext, 'wheel'),
                 ),
                 const SizedBox(height: 10),
                 _CustomColorOptionCard(
                   icon: Icons.photo_library_rounded,
                   title: 'Pick from photo',
                   subtitle: 'Upload a photo and tap any pixel color',
-                  onTap: () => Navigator.pop(sheetContext, 'photo'),
+                  onTap: () => Navigator.pop(dialogContext, 'photo'),
                 ),
                 const SizedBox(height: 12),
                 SizedBox(
                   width: double.infinity,
                   child: OutlinedButton(
-                    onPressed: () => Navigator.pop(sheetContext),
+                    onPressed: () => Navigator.pop(dialogContext),
                     child: const Text('Cancel'),
                   ),
                 ),
               ],
             ),
-          ),
-        );
-      },
+          );
+        },
+      ),
     );
 
     if (!context.mounted || choice == null) return null;
@@ -4580,7 +7716,7 @@ class IconSelectionPage extends StatelessWidget {
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
-                      Icon(iconFor(icon), color: selected ? selectedColorValue : Theme.of(context).colorScheme.onSurface, size: 28),
+                      iconGlyph(context, icon, color: selected ? selectedColorValue : Theme.of(context).colorScheme.onSurface, size: 28, imageBackground: Colors.white.withOpacity(.92)),
                       if (selected)
                         Positioned(
                           right: 5,
@@ -4623,11 +7759,11 @@ class CategoryTile extends StatelessWidget {
 }
 
 Future<void> showCategoryEditor(BuildContext context, {Category? category, CategoryType? initialType}) async {
-  await showModalBottomSheet(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    builder: (_) => CategoryEditor(category: category, initialType: initialType),
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 720,
+    child: CategoryEditor(category: category, initialType: initialType),
   );
 }
 
@@ -4664,7 +7800,7 @@ class _CategoryEditorState extends State<CategoryEditor> {
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -4721,17 +7857,11 @@ class TransactionListScreen extends StatelessWidget {
         IconButton(onPressed: () => showDateRangeSheet(context), icon: const Icon(Icons.date_range_rounded)),
         IconButton(onPressed: () => showFilterSheet(context), icon: const Icon(Icons.filter_alt_rounded)),
       ],
-      child: ResponsiveContent(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            ActiveFilterChips(state: state),
-            if (txs.isEmpty)
-              EmptyCard(icon: Icons.receipt_long_rounded, title: 'No transactions', body: 'Create a transaction or change filters.', action: () => showTransactionEditor(context), actionLabel: 'Add transaction')
-            else
-              ...txs.map((tx) => Padding(padding: const EdgeInsets.only(bottom: 10), child: TransactionTile(tx: tx))),
-          ],
-        ),
+      child: ResponsiveListContent(
+        header: [ActiveFilterChips(state: state)],
+        itemCount: txs.length,
+        empty: EmptyCard(icon: Icons.receipt_long_rounded, title: 'No transactions', body: 'Create a transaction or change filters.', action: () => showTransactionEditor(context), actionLabel: 'Add transaction'),
+        itemBuilder: (context, index) => TransactionTile(tx: txs[index]),
       ),
     );
   }
@@ -4802,11 +7932,11 @@ class TransactionTile extends StatelessWidget {
 
 
 Future<void> showTransactionEditor(BuildContext context, {MoneyTransaction? transaction, Category? lockedCategory}) async {
-  await showModalBottomSheet(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    builder: (_) => TransactionEditor(transaction: transaction, lockedCategory: lockedCategory),
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 700,
+    child: TransactionEditor(transaction: transaction, lockedCategory: lockedCategory),
   );
 }
 
@@ -4844,24 +7974,30 @@ class _TransactionEditorState extends State<TransactionEditor> {
     } else {
       type = widget.lockedCategory?.type == CategoryType.income ? MoneyTransactionType.income : MoneyTransactionType.expense;
       categoryId = widget.lockedCategory?.id ?? (type == MoneyTransactionType.income ? state.defaultIncomeCategoryId : state.defaultExpenseCategoryId);
-      fromAccountId = state.defaultAccountId ?? state.accounts.firstOrNull?.id;
+      fromAccountId = state.defaultAccountId ?? state.operatingAccounts.firstOrNull?.id;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
+    final regularAccountOptions = state.operatingAccounts.isEmpty ? state.accounts : state.operatingAccounts;
+    final transferFromOptions = state.accounts.where((a) => a.id != toAccountId).toList();
+    final transferToOptions = state.accounts.where((a) => a.id != fromAccountId).toList();
+    final accountOptions = type == MoneyTransactionType.transfer ? state.accounts : regularAccountOptions;
+    final fromAccount = state.accounts.where((a) => a.id == fromAccountId).firstOrNull;
+    final toAccount = state.accounts.where((a) => a.id == toAccountId).firstOrNull;
     final relevantCategories = state.categories.where((c) => c.type == (type == MoneyTransactionType.income ? CategoryType.income : CategoryType.expense) && !c.isLoanSystemCategory).toList();
-    if (type == MoneyTransactionType.transfer) categoryId = categoryId ?? state.categories.firstOrNull?.id;
+    if (type == MoneyTransactionType.transfer) categoryId = '';
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(widget.transaction == null ? 'Add transaction' : 'Edit transaction', textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
-            const SizedBox(height: 16),
+            Text(widget.transaction == null ? 'Add transaction' : 'Edit transaction', textAlign: TextAlign.center, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+            const SizedBox(height: 12),
             SleekPillSelector<MoneyTransactionType>(
               options: const [
                 SleekPillOption(value: MoneyTransactionType.expense, label: 'Expense', icon: Icons.north_east_rounded),
@@ -4877,10 +8013,19 @@ class _TransactionEditorState extends State<TransactionEditor> {
                   categoryId = type == MoneyTransactionType.income
                       ? state.defaultIncomeCategoryId ?? newCategories.firstOrNull?.id
                       : state.defaultExpenseCategoryId ?? newCategories.firstOrNull?.id;
+                  final regularOptions = state.operatingAccounts.isEmpty ? state.accounts : state.operatingAccounts;
+                  if (fromAccountId == null || regularOptions.where((a) => a.id == fromAccountId).firstOrNull == null) {
+                    fromAccountId = state.defaultAccountId ?? regularOptions.firstOrNull?.id;
+                  }
+                  toAccountId = null;
+                } else {
+                  categoryId = '';
+                  fromAccountId = fromAccountId ?? state.accounts.firstOrNull?.id;
+                  if (toAccountId == fromAccountId) toAccountId = null;
                 }
               }),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
             AmountPadField(controller: amount),
             const SizedBox(height: 12),
             if (type != MoneyTransactionType.transfer && widget.lockedCategory == null)
@@ -4903,32 +8048,42 @@ class _TransactionEditorState extends State<TransactionEditor> {
             const SizedBox(height: 12),
             AppleSelectionField(
               label: type == MoneyTransactionType.transfer ? 'From account' : 'Account',
-              option: state.accounts.where((a) => a.id == fromAccountId).firstOrNull == null ? null : optionFromAccount(state.accounts.where((a) => a.id == fromAccountId).first, state),
+              option: fromAccount == null ? null : optionFromAccount(fromAccount, state),
               emptyText: 'Choose account',
               onTap: () async {
                 final selected = await showAppleWheelSelectionSheet(
                   context,
                   title: type == MoneyTransactionType.transfer ? 'Choose From Account' : 'Choose Account',
                   selectedId: fromAccountId,
-                  options: state.accounts.map((a) => optionFromAccount(a, state)).toList(),
+                  options: (type == MoneyTransactionType.transfer ? transferFromOptions : accountOptions).map((a) => optionFromAccount(a, state)).toList(),
                 );
-                if (selected != null) setState(() => fromAccountId = selected);
+                if (selected != null) {
+                  setState(() {
+                    fromAccountId = selected;
+                    if (toAccountId == selected) toAccountId = null;
+                  });
+                }
               },
             ),
             if (type == MoneyTransactionType.transfer) ...[
               const SizedBox(height: 12),
               AppleSelectionField(
                 label: 'To account',
-                option: state.accounts.where((a) => a.id == toAccountId).firstOrNull == null ? null : optionFromAccount(state.accounts.where((a) => a.id == toAccountId).first, state),
+                option: toAccount == null ? null : optionFromAccount(toAccount, state),
                 emptyText: 'Choose destination account',
                 onTap: () async {
                   final selected = await showAppleWheelSelectionSheet(
                     context,
                     title: 'Choose To Account',
                     selectedId: toAccountId,
-                    options: state.accounts.map((a) => optionFromAccount(a, state)).toList(),
+                    options: transferToOptions.map((a) => optionFromAccount(a, state)).toList(),
                   );
-                  if (selected != null) setState(() => toAccountId = selected);
+                  if (selected != null) {
+                    setState(() {
+                      toAccountId = selected;
+                      if (fromAccountId == selected) fromAccountId = null;
+                    });
+                  }
                 },
               ),
             ],
@@ -4955,7 +8110,7 @@ class _TransactionEditorState extends State<TransactionEditor> {
                   type: type,
                   amount: value,
                   notes: notes.text.trim(),
-                  categoryId: categoryId ?? '',
+                  categoryId: type == MoneyTransactionType.transfer ? '' : (categoryId ?? ''),
                   fromAccountId: fromAccountId!,
                   toAccountId: type == MoneyTransactionType.transfer ? toAccountId : null,
                   loanId: widget.transaction?.loanId,
@@ -5005,7 +8160,7 @@ class _AmountPadFieldState extends State<AmountPadField> {
   Widget build(BuildContext context) {
     final keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '.', '⌫'];
     return ExpressiveCard(
-      padding: const EdgeInsets.all(12),
+      padding: const EdgeInsets.all(10),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -5016,15 +8171,15 @@ class _AmountPadFieldState extends State<AmountPadField> {
             enableInteractiveSelection: false,
             keyboardType: TextInputType.none,
             textAlign: TextAlign.end,
-            style: Theme.of(context).textTheme.displaySmall?.copyWith(fontWeight: FontWeight.w900),
+            style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900),
             decoration: const InputDecoration(prefixIcon: Icon(Icons.calculate_rounded), labelText: 'Amount'),
           ),
-          const SizedBox(height: 12),
+          const SizedBox(height: 8),
           LayoutBuilder(
             builder: (context, constraints) {
-              const spacing = 10.0;
+              const spacing = 8.0;
               final buttonWidth = (constraints.maxWidth - spacing * 2) / 3;
-              final buttonHeight = (buttonWidth * 0.42).clamp(54.0, 72.0).toDouble();
+              final buttonHeight = (buttonWidth * 0.36).clamp(46.0, 58.0).toDouble();
               return Wrap(
                 spacing: spacing,
                 runSpacing: spacing,
@@ -5059,7 +8214,7 @@ class _AmountPadButton extends StatelessWidget {
     final isAction = label == 'C' || label == '⌫';
     return Material(
       color: isAction ? scheme.secondaryContainer : scheme.primaryContainer,
-      borderRadius: BorderRadius.circular(24),
+      borderRadius: BorderRadius.circular(20),
       clipBehavior: Clip.antiAlias,
       child: InkWell(
         onTap: onPressed,
@@ -5072,7 +8227,7 @@ class _AmountPadButton extends StatelessWidget {
               textHeightBehavior: const TextHeightBehavior(applyHeightToFirstAscent: false, applyHeightToLastDescent: false),
               style: TextStyle(
                 color: isAction ? scheme.onSecondaryContainer : scheme.onPrimaryContainer,
-                fontSize: 26,
+                fontSize: 23,
                 height: 1,
                 fontWeight: FontWeight.w900,
               ),
@@ -5085,47 +8240,90 @@ class _AmountPadButton extends StatelessWidget {
 }
 
 Future<void> showDateRangeSheet(BuildContext context) async {
-  await showModalBottomSheet(context: context, showDragHandle: true, builder: (_) => const DateRangeSheet());
-}
+  final state = context.read<AppController>();
+  final selectedId = await showAppleWheelSelectionSheet(
+    context,
+    title: 'Choose Date Filter',
+    selectedId: enumName(state.dateRangeType),
+    options: DateRangeType.values.map(optionFromDateRangeType).toList(),
+  );
+  if (selectedId == null) return;
+  final selected = DateRangeType.values.firstWhere(
+    (type) => enumName(type) == selectedId,
+    orElse: () => state.dateRangeType,
+  );
 
-class DateRangeSheet extends StatelessWidget {
-  const DateRangeSheet({super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    final state = context.watch<AppController>();
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text('Date range', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
-          const SizedBox(height: 14),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: DateRangeType.values.map((t) => ChoiceChip(label: Text(_rangeLabel(t)), selected: state.dateRangeType == t, onSelected: (_) async {
-              if (t == DateRangeType.custom) {
-                final start = await pickDate(context, state.customStart ?? DateTime.now());
-                if (!context.mounted || start == null) return;
-                final end = await pickDate(context, state.customEnd ?? start);
-                await state.setDateRange(t, start: start, end: end ?? start);
-              } else {
-                await state.setDateRange(t);
-              }
-              if (context.mounted) Navigator.pop(context);
-            })).toList(),
-          ),
-        ],
-      ),
-    );
+  if (selected == DateRangeType.custom) {
+    final start = await pickDate(context, state.customStart ?? DateTime.now());
+    if (!context.mounted || start == null) return;
+    final end = await pickDate(context, state.customEnd ?? start);
+    await state.setDateRange(selected, start: start, end: end ?? start);
+    return;
   }
 
-  String _rangeLabel(DateRangeType type) => _dateRangeLabel(type);
+  await state.setDateRange(selected);
+}
+
+SelectionOption optionFromDateRangeType(DateRangeType type) {
+  switch (type) {
+    case DateRangeType.today:
+      return const SelectionOption(
+        id: 'today',
+        title: 'Today',
+        subtitle: 'Only today',
+        iconName: 'today',
+        iconColor: '#78D8E8',
+      );
+    case DateRangeType.thisWeek:
+      return const SelectionOption(
+        id: 'thisWeek',
+        title: 'This Week',
+        subtitle: 'Current week',
+        iconName: 'week',
+        iconColor: '#A6E3A1',
+      );
+    case DateRangeType.thisMonth:
+      return const SelectionOption(
+        id: 'thisMonth',
+        title: 'This Month',
+        subtitle: 'Current month',
+        iconName: 'month',
+        iconColor: '#78D8E8',
+      );
+    case DateRangeType.thisYear:
+      return const SelectionOption(
+        id: 'thisYear',
+        title: 'This Year',
+        subtitle: 'Current year',
+        iconName: 'year',
+        iconColor: '#FBC879',
+      );
+    case DateRangeType.allTime:
+      return const SelectionOption(
+        id: 'allTime',
+        title: 'All Time',
+        subtitle: 'Everything saved',
+        iconName: 'all_time',
+        iconColor: '#B4A5FF',
+      );
+    case DateRangeType.custom:
+      return const SelectionOption(
+        id: 'custom',
+        title: 'Custom',
+        subtitle: 'Choose start and end date',
+        iconName: 'custom_range',
+        iconColor: '#FFB5D0',
+      );
+  }
 }
 
 Future<void> showFilterSheet(BuildContext context) async {
-  await showModalBottomSheet(context: context, isScrollControlled: true, showDragHandle: true, builder: (_) => const FilterSheet());
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 700,
+    child: const FilterSheet(),
+  );
 }
 
 class FilterSheet extends StatefulWidget {
@@ -5153,7 +8351,7 @@ class _FilterSheetState extends State<FilterSheet> {
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -5183,15 +8381,37 @@ class _FilterSheetState extends State<FilterSheet> {
 // Analysis and category breakdown
 // -----------------------------------------------------------------------------
 
-class AnalysisScreen extends StatelessWidget {
+class AnalysisScreen extends StatefulWidget {
   const AnalysisScreen({super.key});
 
+  @override
+  State<AnalysisScreen> createState() => _AnalysisScreenState();
+}
+
+class _AnalysisScreenState extends State<AnalysisScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     final range = state.activeRange();
     final txs = state.filteredTransactions();
     final summary = state.summaryFor(txs);
+    final fallbackToday = DateTime.now();
+    final fallbackDay = DateTime(fallbackToday.year, fallbackToday.month, fallbackToday.day);
+    DateTime chartStart;
+    DateTime chartEnd;
+    if (range.start != null && range.end != null) {
+      chartStart = range.start!;
+      chartEnd = range.end!;
+    } else if (txs.isNotEmpty) {
+      final sortedDates = txs.map((tx) => tx.createdOn).toList()..sort();
+      final first = sortedDates.first;
+      final last = sortedDates.last;
+      chartStart = DateTime(first.year, first.month, first.day);
+      chartEnd = DateTime(last.year, last.month, last.day).add(const Duration(days: 1));
+    } else {
+      chartStart = fallbackDay;
+      chartEnd = fallbackDay.add(const Duration(days: 1));
+    }
     final daily = <DateTime, Summary>{};
     for (final tx in txs) {
       if (!tx.countsAsIncome && !tx.countsAsExpense) continue;
@@ -5202,27 +8422,21 @@ class AnalysisScreen extends StatelessWidget {
         expense: old.expense + (tx.countsAsExpense ? tx.amount : 0),
       );
     }
+
+    final totalDays = chartEnd.difference(chartStart).inDays;
     List<DateTime> days;
-    if (range.start != null && range.end != null) {
-      final totalDays = range.end!.difference(range.start!).inDays;
-      if (totalDays > 0 && totalDays <= 62) {
-        days = List.generate(
-          totalDays,
-          (index) => DateTime(range.start!.year, range.start!.month, range.start!.day).add(Duration(days: index)),
-        );
-      } else {
-        days = daily.keys.toList()..sort();
-      }
+    if (totalDays > 0 && totalDays <= 62) {
+      days = List.generate(totalDays, (index) => DateTime(chartStart.year, chartStart.month, chartStart.day).add(Duration(days: index)));
     } else if (daily.isNotEmpty) {
       days = daily.keys.toList()..sort();
     } else {
-      final today = DateTime.now();
-      days = [DateTime(today.year, today.month, today.day)];
+      days = [DateTime(chartStart.year, chartStart.month, chartStart.day)];
     }
     for (final day in days) {
       daily.putIfAbsent(day, () => const Summary(income: 0, expense: 0));
     }
     final avgDivisor = math.max(1, days.length);
+
     return PageScaffold(
       title: 'Analysis',
       subtitle: range.label,
@@ -5239,25 +8453,1085 @@ class AnalysisScreen extends StatelessWidget {
             const SizedBox(height: 10),
             MiniMetric('Balance', state.format(summary.balance), Icons.account_balance_wallet_rounded),
             const SectionHeader('Trend'),
-            AnalysisTrendChart(days: days, daily: daily, rangeLabel: range.label),
+            RepaintBoundary(child: AnalysisTrendChart(days: days, daily: daily, rangeLabel: range.label)),
             const SectionHeader('Averages'),
             Row(children: [
               Expanded(child: MiniMetric('Income / day', state.format(summary.income / avgDivisor), Icons.trending_up_rounded)),
               const SizedBox(width: 10),
               Expanded(child: MiniMetric('Expense / day', state.format(summary.expense / avgDivisor), Icons.trending_down_rounded)),
             ]),
-            const SectionHeader('Category analytics'),
-            CategoryBreakdownCard(type: CategoryType.expense),
-            const SizedBox(height: 12),
-            CategoryBreakdownCard(type: CategoryType.income),
           ],
         ),
       ),
     );
-
   }
 }
 
+DateTime financialPeriodStart(FinancialHealthPeriod period, DateTime selectedDate) {
+  return period == FinancialHealthPeriod.monthly ? DateTime(selectedDate.year, selectedDate.month, 1) : DateTime(selectedDate.year, 1, 1);
+}
+
+DateTime financialPeriodEnd(FinancialHealthPeriod period, DateTime selectedDate) {
+  return period == FinancialHealthPeriod.monthly ? DateTime(selectedDate.year, selectedDate.month + 1, 1) : DateTime(selectedDate.year + 1, 1, 1);
+}
+
+String financialPeriodLabel(FinancialHealthPeriod period, DateTime selectedDate) {
+  return period == FinancialHealthPeriod.monthly ? DateFormat('MMMM yyyy').format(selectedDate) : selectedDate.year.toString();
+}
+
+List<SelectionOption> financialMonthOptions() {
+  final now = DateTime.now();
+  return List.generate(144, (index) {
+    final month = DateTime(now.year, now.month - index, 1);
+    return SelectionOption(
+      id: DateFormat('yyyy-MM').format(month),
+      title: DateFormat('MMMM yyyy').format(month),
+      subtitle: index == 0 ? 'Current month' : 'Monthly health summary',
+      iconName: 'month',
+      iconColor: '#78D8E8',
+    );
+  });
+}
+
+List<SelectionOption> financialYearOptions() {
+  final now = DateTime.now();
+  final count = math.max(1, now.year - 1999);
+  return List.generate(count, (index) {
+    final year = now.year - index;
+    return SelectionOption(
+      id: year.toString(),
+      title: year.toString(),
+      subtitle: index == 0 ? 'Current year' : 'Yearly health summary',
+      iconName: 'year',
+      iconColor: '#FBC879',
+    );
+  });
+}
+
+bool isInsideFinancialPeriod(DateTime date, DateTime start, DateTime end) => !date.isBefore(start) && date.isBefore(end);
+
+List<MoneyTransaction> transactionsForFinancialPeriod(AppController state, DateTime start, DateTime end) {
+  return state.transactions.where((tx) => isInsideFinancialPeriod(tx.createdOn, start, end)).toList();
+}
+
+bool transactionTouchesSavings(AppController state, MoneyTransaction tx) {
+  final from = state.accountOf(tx.fromAccountId);
+  final to = tx.toAccountId == null ? null : state.accountOf(tx.toAccountId!);
+  return from?.type == AccountType.savings || to?.type == AccountType.savings;
+}
+
+bool isSavingsTransferIn(AppController state, MoneyTransaction tx) {
+  if (tx.type != MoneyTransactionType.transfer) return false;
+  final from = state.accountOf(tx.fromAccountId);
+  final to = tx.toAccountId == null ? null : state.accountOf(tx.toAccountId!);
+  return from?.type != AccountType.savings && to?.type == AccountType.savings;
+}
+
+bool isSavingsTransferOut(AppController state, MoneyTransaction tx) {
+  if (tx.type != MoneyTransactionType.transfer) return false;
+  final from = state.accountOf(tx.fromAccountId);
+  final to = tx.toAccountId == null ? null : state.accountOf(tx.toAccountId!);
+  return from?.type == AccountType.savings && to?.type != AccountType.savings;
+}
+
+bool isRecurringPaymentTransaction(AppController state, MoneyTransaction tx) {
+  if (!tx.countsAsExpense) return false;
+  final category = state.categoryOf(tx.categoryId)?.name.toLowerCase() ?? '';
+  final notes = tx.notes.toLowerCase();
+  final text = '$category $notes';
+  const keywords = [
+    'bill',
+    'subscription',
+    'tuition',
+    'rent',
+    'internet',
+    'mobile recharge',
+    'recharge',
+    'electricity',
+    'emi',
+    'utility',
+    'school fee',
+    'fee',
+    'netflix',
+    'spotify',
+    'youtube',
+    'installment',
+  ];
+  return keywords.any(text.contains);
+}
+
+class BudgetThresholdCounts {
+  const BudgetThresholdCounts({required this.safe, required this.fifty, required this.eighty, required this.full, required this.over});
+
+  final int safe;
+  final int fifty;
+  final int eighty;
+  final int full;
+  final int over;
+}
+
+class BudgetHealthItem {
+  const BudgetHealthItem({required this.label, required this.month, required this.limit, required this.spent});
+
+  final String label;
+  final DateTime month;
+  final double limit;
+  final double spent;
+
+  double get remaining => limit - spent;
+  double get overspent => math.max(0, spent - limit);
+  double get ratio => limit <= 0 ? 0 : spent / limit;
+  double get percentUsed => ratio * 100;
+  bool get isOverspent => spent > limit && limit > 0;
+
+  String get statusLabel {
+    if (ratio >= 1.0001) return 'Over Budget';
+    if (ratio >= .999) return 'Fully Used';
+    if (ratio >= .8) return 'Near Limit';
+    if (ratio >= .5) return '50% Used';
+    return 'Safe';
+  }
+}
+
+class MonthlyFinancialBreakdown {
+  const MonthlyFinancialBreakdown({
+    required this.month,
+    required this.income,
+    required this.expense,
+    required this.savingsIn,
+    required this.savingsOut,
+    required this.loansGiven,
+    required this.loansTaken,
+    required this.loanRepaymentPaid,
+    required this.loanRepaymentReceived,
+    required this.billPaymentTotal,
+    required this.billPaymentCount,
+    required this.budgetLimit,
+    required this.budgetSpent,
+  });
+
+  final DateTime month;
+  final double income;
+  final double expense;
+  final double savingsIn;
+  final double savingsOut;
+  final double loansGiven;
+  final double loansTaken;
+  final double loanRepaymentPaid;
+  final double loanRepaymentReceived;
+  final double billPaymentTotal;
+  final int billPaymentCount;
+  final double budgetLimit;
+  final double budgetSpent;
+
+  double get cashFlow => income - expense;
+  double get savingsNet => savingsIn - savingsOut;
+  double get budgetRemaining => budgetLimit - budgetSpent;
+  double get overspent => math.max(0, budgetSpent - budgetLimit);
+}
+
+class FinancialHealthSummary {
+  const FinancialHealthSummary({
+    required this.state,
+    required this.period,
+    required this.selectedDate,
+    required this.start,
+    required this.end,
+    required this.periodLabel,
+    required this.income,
+    required this.expense,
+    required this.savingsIn,
+    required this.savingsOut,
+    required this.currentSavingsBalance,
+    required this.loansGiven,
+    required this.loansTaken,
+    required this.loanRepaymentPaid,
+    required this.loanRepaymentReceived,
+    required this.billPaymentTotal,
+    required this.billPaymentCount,
+    required this.billUnpaidCount,
+    required this.billUpcomingCount,
+    required this.billOverdueCount,
+    required this.loanReminderCompletedCount,
+    required this.loanReminderPendingCount,
+    required this.loanReminderPartialCount,
+    required this.loanReminderOverdueCount,
+    required this.budgetItems,
+    required this.budgetCounts,
+    required this.monthlyBreakdowns,
+    required this.status,
+    required this.statusBody,
+  });
+
+  final AppController state;
+  final FinancialHealthPeriod period;
+  final DateTime selectedDate;
+  final DateTime start;
+  final DateTime end;
+  final String periodLabel;
+  final double income;
+  final double expense;
+  final double savingsIn;
+  final double savingsOut;
+  final double currentSavingsBalance;
+  final double loansGiven;
+  final double loansTaken;
+  final double loanRepaymentPaid;
+  final double loanRepaymentReceived;
+  final double billPaymentTotal;
+  final int billPaymentCount;
+  final int billUnpaidCount;
+  final int billUpcomingCount;
+  final int billOverdueCount;
+  final int loanReminderCompletedCount;
+  final int loanReminderPendingCount;
+  final int loanReminderPartialCount;
+  final int loanReminderOverdueCount;
+  final List<BudgetHealthItem> budgetItems;
+  final BudgetThresholdCounts budgetCounts;
+  final List<MonthlyFinancialBreakdown> monthlyBreakdowns;
+  final String status;
+  final String statusBody;
+
+  double get cashFlow => income - expense;
+  double get savingsNet => savingsIn - savingsOut;
+  double get budgetLimit => budgetItems.fold<double>(0, (sum, item) => sum + item.limit);
+  double get budgetSpent => budgetItems.fold<double>(0, (sum, item) => sum + item.spent);
+  double get budgetRemaining => budgetLimit - budgetSpent;
+  double get overspentTotal => budgetItems.fold<double>(0, (sum, item) => sum + item.overspent);
+  List<BudgetHealthItem> get overspentItems => budgetItems.where((item) => item.isOverspent).toList();
+
+  static FinancialHealthSummary build(AppController state, {required FinancialHealthPeriod period, required DateTime selectedDate}) {
+    final start = financialPeriodStart(period, selectedDate);
+    final end = financialPeriodEnd(period, selectedDate);
+    final txs = transactionsForFinancialPeriod(state, start, end);
+    double income = 0;
+    double expense = 0;
+    double savingsIn = 0;
+    double savingsOut = 0;
+    double loansGiven = 0;
+    double loansTaken = 0;
+    double loanRepaymentPaid = 0;
+    double loanRepaymentReceived = 0;
+    double billPaymentTotal = 0;
+    var billPaymentCount = 0;
+
+    for (final tx in txs) {
+      if (tx.countsAsIncome) income += tx.amount;
+      if (tx.countsAsExpense) expense += tx.amount;
+      if (isSavingsTransferIn(state, tx)) savingsIn += tx.amount;
+      if (isSavingsTransferOut(state, tx)) savingsOut += tx.amount;
+      if (tx.isLoanPrincipal) {
+        if (tx.type == MoneyTransactionType.expense) loansGiven += tx.amount;
+        if (tx.type == MoneyTransactionType.income) loansTaken += tx.amount;
+      }
+      if (tx.isLoanRepayment) {
+        if (tx.type == MoneyTransactionType.expense) loanRepaymentPaid += tx.amount;
+        if (tx.type == MoneyTransactionType.income) loanRepaymentReceived += tx.amount;
+      }
+      if (isRecurringPaymentTransaction(state, tx)) {
+        billPaymentTotal += tx.amount;
+        billPaymentCount++;
+      }
+    }
+
+    var loanReminderCompleted = 0;
+    var loanReminderPending = 0;
+    var loanReminderPartial = 0;
+    var loanReminderOverdue = 0;
+    for (final reminder in state.loanRepaymentReminders) {
+      final paidInPeriod = reminder.isPaid && reminder.paidOn != null && isInsideFinancialPeriod(reminder.paidOn!, start, end);
+      final dueInPeriod = isInsideFinancialPeriod(reminder.dueDate, start, end);
+      if (!paidInPeriod && !dueInPeriod) continue;
+      final loan = state.loanOf(reminder.loanId);
+      if (paidInPeriod) loanReminderCompleted++;
+      if (!reminder.isPaid && reminder.isOverdue) {
+        loanReminderOverdue++;
+      } else if (!reminder.isPaid) {
+        loanReminderPending++;
+      }
+      if (loan != null && loan.repaidAmount > 0 && loan.remainingAmount > 0) loanReminderPartial++;
+    }
+
+    final budgetItems = budgetHealthItemsForPeriod(state, period, selectedDate);
+    var safe = 0;
+    var fifty = 0;
+    var eighty = 0;
+    var full = 0;
+    var over = 0;
+    for (final item in budgetItems) {
+      if (item.ratio >= 1.0001) {
+        over++;
+      } else if (item.ratio >= .999) {
+        full++;
+      } else if (item.ratio >= .8) {
+        eighty++;
+      } else if (item.ratio >= .5) {
+        fifty++;
+      } else {
+        safe++;
+      }
+    }
+
+    final monthlyBreakdowns = period == FinancialHealthPeriod.yearly
+        ? List.generate(12, (index) => monthlyBreakdownFor(state, DateTime(selectedDate.year, index + 1, 1)))
+        : <MonthlyFinancialBreakdown>[];
+
+    final statusInfo = financialHealthStatus(
+      period: period,
+      income: income,
+      expense: expense,
+      savingsNet: savingsIn - savingsOut,
+      loansTaken: loansTaken,
+      loanRepaymentPaid: loanRepaymentPaid,
+      overspentTotal: budgetItems.fold<double>(0, (sum, item) => sum + item.overspent),
+    );
+
+    return FinancialHealthSummary(
+      state: state,
+      period: period,
+      selectedDate: selectedDate,
+      start: start,
+      end: end,
+      periodLabel: financialPeriodLabel(period, selectedDate),
+      income: income,
+      expense: expense,
+      savingsIn: savingsIn,
+      savingsOut: savingsOut,
+      currentSavingsBalance: state.savingAccountBalance,
+      loansGiven: loansGiven,
+      loansTaken: loansTaken,
+      loanRepaymentPaid: loanRepaymentPaid,
+      loanRepaymentReceived: loanRepaymentReceived,
+      billPaymentTotal: billPaymentTotal,
+      billPaymentCount: billPaymentCount,
+      billUnpaidCount: 0,
+      billUpcomingCount: 0,
+      billOverdueCount: 0,
+      loanReminderCompletedCount: loanReminderCompleted,
+      loanReminderPendingCount: loanReminderPending,
+      loanReminderPartialCount: loanReminderPartial,
+      loanReminderOverdueCount: loanReminderOverdue,
+      budgetItems: budgetItems,
+      budgetCounts: BudgetThresholdCounts(safe: safe, fifty: fifty, eighty: eighty, full: full, over: over),
+      monthlyBreakdowns: monthlyBreakdowns,
+      status: statusInfo.$1,
+      statusBody: statusInfo.$2,
+    );
+  }
+}
+
+(String, String) financialHealthStatus({
+  required FinancialHealthPeriod period,
+  required double income,
+  required double expense,
+  required double savingsNet,
+  required double loansTaken,
+  required double loanRepaymentPaid,
+  required double overspentTotal,
+}) {
+  final label = period == FinancialHealthPeriod.monthly ? 'month' : 'year';
+  if (loansTaken > loanRepaymentPaid && loansTaken > 0) {
+    return ('Increased Debt', 'Borrowed amount was higher than debt repayment in this $label.');
+  }
+  if (loanRepaymentPaid > loansTaken && loanRepaymentPaid > 0) {
+    return ('Reduced Debt', 'Debt repayment was higher than new borrowing in this $label.');
+  }
+  if (overspentTotal > 0 || expense > income) {
+    return ('Overspent', 'Expenses or budget usage were higher than the safe limit in this $label.');
+  }
+  if (savingsNet > math.max(100, income * .18)) {
+    return ('Strong Savings Growth', 'Savings transfers were strong compared with income in this $label.');
+  }
+  if (income > expense) {
+    return ('Saved Money', 'Income stayed above expenses in this $label.');
+  }
+  return ('Stable ${period == FinancialHealthPeriod.monthly ? 'Month' : 'Year'}', 'Money flow stayed close to neutral in this $label.');
+}
+
+List<BudgetHealthItem> budgetHealthItemsForPeriod(AppController state, FinancialHealthPeriod period, DateTime selectedDate) {
+  final items = <BudgetHealthItem>[];
+  for (final budget in state.budgets) {
+    final month = DateTime(budget.selectedMonth.year, budget.selectedMonth.month, 1);
+    if (period == FinancialHealthPeriod.monthly) {
+      if (month.year != selectedDate.year || month.month != selectedDate.month) continue;
+    } else if (month.year != selectedDate.year) {
+      continue;
+    }
+    final start = DateTime(month.year, month.month, 1);
+    final end = DateTime(month.year, month.month + 1, 1);
+    final txs = state.transactions.where((tx) {
+      if (!tx.countsAsExpense) return false;
+      if (!isInsideFinancialPeriod(tx.createdOn, start, end)) return false;
+      if (!budget.allAccountsSelected && !budget.accountIds.contains(tx.fromAccountId)) return false;
+      if (!budget.allCategoriesSelected && !budget.categoryIds.contains(tx.categoryId)) return false;
+      return true;
+    }).toList();
+    final spent = txs.fold<double>(0, (sum, tx) => sum + tx.amount);
+    final categoryNames = budget.allCategoriesSelected
+        ? 'All expense categories'
+        : budget.categoryIds.map((id) => state.categoryOf(id)?.name ?? 'Category').take(3).join(', ');
+    final accountNames = budget.allAccountsSelected ? 'all accounts' : budget.accountIds.map((id) => state.accountOf(id)?.name ?? 'Account').take(2).join(', ');
+    final label = period == FinancialHealthPeriod.yearly ? '${DateFormat('MMM').format(month)} • $categoryNames' : '$categoryNames • $accountNames';
+    items.add(BudgetHealthItem(label: label, month: month, limit: budget.amount, spent: spent));
+  }
+  return items;
+}
+
+MonthlyFinancialBreakdown monthlyBreakdownFor(AppController state, DateTime month) {
+  final start = DateTime(month.year, month.month, 1);
+  final end = DateTime(month.year, month.month + 1, 1);
+  final txs = transactionsForFinancialPeriod(state, start, end);
+  double income = 0;
+  double expense = 0;
+  double savingsIn = 0;
+  double savingsOut = 0;
+  double loansGiven = 0;
+  double loansTaken = 0;
+  double loanRepaymentPaid = 0;
+  double loanRepaymentReceived = 0;
+  double billPaymentTotal = 0;
+  var billPaymentCount = 0;
+  for (final tx in txs) {
+    if (tx.countsAsIncome) income += tx.amount;
+    if (tx.countsAsExpense) expense += tx.amount;
+    if (isSavingsTransferIn(state, tx)) savingsIn += tx.amount;
+    if (isSavingsTransferOut(state, tx)) savingsOut += tx.amount;
+    if (tx.isLoanPrincipal) {
+      if (tx.type == MoneyTransactionType.expense) loansGiven += tx.amount;
+      if (tx.type == MoneyTransactionType.income) loansTaken += tx.amount;
+    }
+    if (tx.isLoanRepayment) {
+      if (tx.type == MoneyTransactionType.expense) loanRepaymentPaid += tx.amount;
+      if (tx.type == MoneyTransactionType.income) loanRepaymentReceived += tx.amount;
+    }
+    if (isRecurringPaymentTransaction(state, tx)) {
+      billPaymentTotal += tx.amount;
+      billPaymentCount++;
+    }
+  }
+  final budgetItems = budgetHealthItemsForPeriod(state, FinancialHealthPeriod.monthly, month);
+  return MonthlyFinancialBreakdown(
+    month: month,
+    income: income,
+    expense: expense,
+    savingsIn: savingsIn,
+    savingsOut: savingsOut,
+    loansGiven: loansGiven,
+    loansTaken: loansTaken,
+    loanRepaymentPaid: loanRepaymentPaid,
+    loanRepaymentReceived: loanRepaymentReceived,
+    billPaymentTotal: billPaymentTotal,
+    billPaymentCount: billPaymentCount,
+    budgetLimit: budgetItems.fold<double>(0, (sum, item) => sum + item.limit),
+    budgetSpent: budgetItems.fold<double>(0, (sum, item) => sum + item.spent),
+  );
+}
+
+class FinancialHealthPeriodCard extends StatelessWidget {
+  const FinancialHealthPeriodCard({super.key, required this.period, required this.selectedDate, required this.onPeriodChanged, required this.onPickDate});
+
+  final FinancialHealthPeriod period;
+  final DateTime selectedDate;
+  final ValueChanged<FinancialHealthPeriod> onPeriodChanged;
+  final VoidCallback onPickDate;
+
+  @override
+  Widget build(BuildContext context) {
+    final selectedLabel = financialPeriodLabel(period, selectedDate);
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SegmentedButton<FinancialHealthPeriod>(
+            segments: const [
+              ButtonSegment(value: FinancialHealthPeriod.monthly, label: Text('Monthly'), icon: Icon(Icons.calendar_month_rounded)),
+              ButtonSegment(value: FinancialHealthPeriod.yearly, label: Text('Yearly'), icon: Icon(Icons.calendar_view_month_rounded)),
+            ],
+            selected: {period},
+            onSelectionChanged: (value) => onPeriodChanged(value.first),
+            showSelectedIcon: false,
+          ),
+          const SizedBox(height: 12),
+          Material(
+            color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.48),
+            borderRadius: BorderRadius.circular(18),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(18),
+              onTap: onPickDate,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                child: Row(
+                  children: [
+                    iconBubble(context, period == FinancialHealthPeriod.monthly ? 'month' : 'year', period == FinancialHealthPeriod.monthly ? '#78D8E8' : '#FBC879', size: 42),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(selectedLabel, style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+                          Text(period == FinancialHealthPeriod.monthly ? 'Tap to choose another month' : 'Tap to choose another year', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                        ],
+                      ),
+                    ),
+                    Icon(Icons.keyboard_arrow_down_rounded, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class FinancialHealthSummarySection extends StatelessWidget {
+  const FinancialHealthSummarySection({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = summary.state;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SectionHeader('Financial Health Summary'),
+        FinancialHealthStatusCard(summary: summary),
+        const SizedBox(height: 10),
+        HealthMetricWrap(metrics: [
+          HealthMetricData('Money flow', state.format(summary.cashFlow), Icons.compare_arrows_rounded),
+          HealthMetricData('Savings in', state.format(summary.savingsIn), Icons.savings_rounded),
+          HealthMetricData('Savings out', state.format(summary.savingsOut), Icons.output_rounded),
+          HealthMetricData('Savings change', state.format(summary.savingsNet), Icons.trending_up_rounded),
+          HealthMetricData('Current savings', state.format(summary.currentSavingsBalance), Icons.account_balance_rounded),
+          HealthMetricData('Loans given', state.format(summary.loansGiven), Icons.north_east_rounded),
+          HealthMetricData('Loans taken', state.format(summary.loansTaken), Icons.south_west_rounded),
+          HealthMetricData('Repayment paid', state.format(summary.loanRepaymentPaid), Icons.payments_rounded),
+          HealthMetricData('Repayment received', state.format(summary.loanRepaymentReceived), Icons.call_received_rounded),
+          HealthMetricData('Recurring paid', state.format(summary.billPaymentTotal), Icons.receipt_long_rounded),
+          HealthMetricData('Budget remaining', state.format(summary.budgetRemaining), Icons.pie_chart_rounded),
+          HealthMetricData('Overspent', state.format(summary.overspentTotal), Icons.warning_rounded),
+        ]),
+        const SizedBox(height: 10),
+        FinancialHealthCharts(summary: summary),
+        const SizedBox(height: 10),
+        BudgetHealthCard(summary: summary),
+        const SizedBox(height: 10),
+        LoanAndBillStatusCard(summary: summary),
+        if (summary.overspentItems.isNotEmpty) ...[
+          const SizedBox(height: 10),
+          OverspendingCategoriesCard(summary: summary),
+        ],
+        if (summary.period == FinancialHealthPeriod.yearly) ...[
+          const SizedBox(height: 10),
+          YearlyComparisonCard(summary: summary),
+          const SizedBox(height: 10),
+          YearlyBreakdownCard(summary: summary),
+        ],
+      ],
+    );
+  }
+}
+
+class FinancialHealthStatusCard extends StatelessWidget {
+  const FinancialHealthStatusCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  Color _statusColor() {
+    final lower = summary.status.toLowerCase();
+    if (lower.contains('over') || lower.contains('debt')) return kSleekExpense;
+    if (lower.contains('strong') || lower.contains('saved') || lower.contains('reduced')) return kSleekIncome;
+    return kSleekAccent;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final color = _statusColor();
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 52,
+            height: 52,
+            decoration: BoxDecoration(color: color.withOpacity(.15), borderRadius: BorderRadius.circular(18), border: Border.all(color: color.withOpacity(.30))),
+            child: Icon(Icons.health_and_safety_rounded, color: color),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    Text(summary.status, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+                    HealthStatusPill(label: summary.periodLabel, color: color),
+                    const HealthStatusPill(label: 'Savings transfers are internal', color: kSleekAccent),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(summary.statusBody, style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class HealthStatusPill extends StatelessWidget {
+  const HealthStatusPill({super.key, required this.label, required this.color});
+
+  final String label;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(color: color.withOpacity(.12), borderRadius: BorderRadius.circular(999), border: Border.all(color: color.withOpacity(.24))),
+      child: Text(label, style: Theme.of(context).textTheme.labelMedium?.copyWith(color: color, fontWeight: FontWeight.w900)),
+    );
+  }
+}
+
+class HealthMetricData {
+  const HealthMetricData(this.label, this.value, this.icon);
+  final String label;
+  final String value;
+  final IconData icon;
+}
+
+class HealthMetricWrap extends StatelessWidget {
+  const HealthMetricWrap({super.key, required this.metrics});
+
+  final List<HealthMetricData> metrics;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final twoColumns = constraints.maxWidth >= 680;
+        final width = twoColumns ? (constraints.maxWidth - 10) / 2 : constraints.maxWidth;
+        return Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: metrics.map((metric) => SizedBox(width: width, child: MiniMetric(metric.label, metric.value, metric.icon))).toList(),
+        );
+      },
+    );
+  }
+}
+
+class FinancialHealthCharts extends StatelessWidget {
+  const FinancialHealthCharts({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = summary.state;
+    final budgetRemaining = math.max(0.0, summary.budgetRemaining);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final twoColumns = constraints.maxWidth >= 760;
+        final width = twoColumns ? (constraints.maxWidth - 10) / 2 : constraints.maxWidth;
+        return Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            SizedBox(
+              width: width,
+              child: HealthBarChartCard(
+                title: 'Income vs Expense',
+                icon: Icons.stacked_bar_chart_rounded,
+                bars: [
+                  HealthBarData('Income', summary.income, state.format(summary.income), kSleekIncome),
+                  HealthBarData('Expense', summary.expense, state.format(summary.expense), kSleekExpense),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: width,
+              child: HealthBarChartCard(
+                title: 'Savings Growth',
+                icon: Icons.savings_rounded,
+                bars: [
+                  HealthBarData('Transferred in', summary.savingsIn, state.format(summary.savingsIn), kSleekIncome),
+                  HealthBarData('Transferred out', summary.savingsOut, state.format(summary.savingsOut), kSleekExpense),
+                  HealthBarData('Net change', summary.savingsNet.abs(), state.format(summary.savingsNet), summary.savingsNet >= 0 ? kSleekIncome : kSleekExpense),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: width,
+              child: HealthBarChartCard(
+                title: 'Loan Activity',
+                icon: Icons.account_balance_rounded,
+                bars: [
+                  HealthBarData('Given', summary.loansGiven, state.format(summary.loansGiven), const Color(0xFFFF9AA2)),
+                  HealthBarData('Taken', summary.loansTaken, state.format(summary.loansTaken), const Color(0xFF8AB4FF)),
+                  HealthBarData('Paid', summary.loanRepaymentPaid, state.format(summary.loanRepaymentPaid), kSleekExpense),
+                  HealthBarData('Received', summary.loanRepaymentReceived, state.format(summary.loanRepaymentReceived), kSleekIncome),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: width,
+              child: HealthBarChartCard(
+                title: 'Budget Usage',
+                icon: Icons.pie_chart_rounded,
+                bars: [
+                  HealthBarData('Used', summary.budgetSpent, state.format(summary.budgetSpent), kSleekWarning),
+                  HealthBarData('Remaining', budgetRemaining, state.format(summary.budgetRemaining), kSleekIncome),
+                  HealthBarData('Overspent', summary.overspentTotal, state.format(summary.overspentTotal), kSleekExpense),
+                ],
+              ),
+            ),
+            SizedBox(
+              width: width,
+              child: HealthBarChartCard(
+                title: 'Recurring Payments',
+                icon: Icons.repeat_rounded,
+                bars: [
+                  HealthBarData('Paid bills', summary.billPaymentTotal, state.format(summary.billPaymentTotal), kSleekAccent),
+                  HealthBarData('Loan reminders', (summary.loanReminderPendingCount + summary.loanReminderOverdueCount).toDouble(), '${summary.loanReminderPendingCount + summary.loanReminderOverdueCount}', kSleekWarning),
+                  HealthBarData('Overdue alerts', summary.loanReminderOverdueCount.toDouble(), '${summary.loanReminderOverdueCount}', kSleekExpense),
+                ],
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class HealthBarData {
+  const HealthBarData(this.label, this.value, this.displayValue, this.color);
+  final String label;
+  final double value;
+  final String displayValue;
+  final Color color;
+}
+
+class HealthBarChartCard extends StatelessWidget {
+  const HealthBarChartCard({super.key, required this.title, required this.icon, required this.bars});
+
+  final String title;
+  final IconData icon;
+  final List<HealthBarData> bars;
+
+  @override
+  Widget build(BuildContext context) {
+    final maxValue = bars.fold<double>(0, (max, bar) => math.max(max, bar.value.abs()));
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, color: kSleekAccent),
+              const SizedBox(width: 8),
+              Expanded(child: Text(title, style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900))),
+            ],
+          ),
+          const SizedBox(height: 14),
+          ...bars.map((bar) => Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: HealthBarRow(data: bar, maxValue: maxValue),
+              )),
+        ],
+      ),
+    );
+  }
+}
+
+class HealthBarRow extends StatelessWidget {
+  const HealthBarRow({super.key, required this.data, required this.maxValue});
+
+  final HealthBarData data;
+  final double maxValue;
+
+  @override
+  Widget build(BuildContext context) {
+    final factor = maxValue <= 0 ? 0.0 : (data.value.abs() / maxValue).clamp(0.0, 1.0).toDouble();
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            Expanded(child: Text(data.label, style: Theme.of(context).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800))),
+            const SizedBox(width: 8),
+            Text(data.displayValue, style: Theme.of(context).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w900)),
+          ],
+        ),
+        const SizedBox(height: 6),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(999),
+          child: Container(
+            height: 10,
+            color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.58),
+            alignment: Alignment.centerLeft,
+            child: FractionallySizedBox(
+              widthFactor: factor,
+              child: Container(decoration: BoxDecoration(color: data.color, borderRadius: BorderRadius.circular(999))),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class BudgetHealthCard extends StatelessWidget {
+  const BudgetHealthCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = summary.state;
+    final counts = summary.budgetCounts;
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Budget status', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              HealthStatusPill(label: 'Safe ${counts.safe}', color: kSleekIncome),
+              HealthStatusPill(label: '50% ${counts.fifty}', color: kSleekAccent),
+              HealthStatusPill(label: '80% ${counts.eighty}', color: kSleekWarning),
+              HealthStatusPill(label: '100% ${counts.full}', color: const Color(0xFFFFB86B)),
+              HealthStatusPill(label: 'Over ${counts.over}', color: kSleekExpense),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(children: [
+            Expanded(child: MiniMetric('Budget limit', state.format(summary.budgetLimit), Icons.flag_rounded)),
+            const SizedBox(width: 10),
+            Expanded(child: MiniMetric('Remaining budget', state.format(summary.budgetRemaining), Icons.savings_rounded)),
+          ]),
+        ],
+      ),
+    );
+  }
+}
+
+class LoanAndBillStatusCard extends StatelessWidget {
+  const LoanAndBillStatusCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Reminders and scheduled payments', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              HealthStatusPill(label: 'Bills paid ${summary.billPaymentCount}', color: kSleekAccent),
+              HealthStatusPill(label: 'Bills unpaid ${summary.billUnpaidCount}', color: kSleekWarning),
+              HealthStatusPill(label: 'Bills upcoming ${summary.billUpcomingCount}', color: const Color(0xFF8AB4FF)),
+              HealthStatusPill(label: 'Bills overdue ${summary.billOverdueCount}', color: kSleekExpense),
+              HealthStatusPill(label: 'Loan completed ${summary.loanReminderCompletedCount}', color: kSleekIncome),
+              HealthStatusPill(label: 'Loan pending ${summary.loanReminderPendingCount}', color: kSleekWarning),
+              HealthStatusPill(label: 'Loan partial ${summary.loanReminderPartialCount}', color: kSleekAccent),
+              HealthStatusPill(label: 'Loan overdue ${summary.loanReminderOverdueCount}', color: kSleekExpense),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class OverspendingCategoriesCard extends StatelessWidget {
+  const OverspendingCategoriesCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = summary.state;
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Overspending categories', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 8),
+          ...summary.overspentItems.map((item) => Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: kSleekExpense.withOpacity(.08),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: kSleekExpense.withOpacity(.18)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(child: Text(item.label, style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900))),
+                          Text('${item.percentUsed.toStringAsFixed(0)}%', style: Theme.of(context).textTheme.titleSmall?.copyWith(color: kSleekExpense, fontWeight: FontWeight.w900)),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      Text('Spent ${state.format(item.spent)} • Limit ${state.format(item.limit)} • Overspent ${state.format(item.overspent)}', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                    ],
+                  ),
+                ),
+              )),
+        ],
+      ),
+    );
+  }
+}
+
+class YearlyComparisonCard extends StatelessWidget {
+  const YearlyComparisonCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  MonthlyFinancialBreakdown? _maxBy(double Function(MonthlyFinancialBreakdown item) selector) {
+    if (summary.monthlyBreakdowns.isEmpty) return null;
+    return summary.monthlyBreakdowns.reduce((a, b) => selector(a) >= selector(b) ? a : b);
+  }
+
+  MonthlyFinancialBreakdown? _minBy(double Function(MonthlyFinancialBreakdown item) selector) {
+    if (summary.monthlyBreakdowns.isEmpty) return null;
+    return summary.monthlyBreakdowns.reduce((a, b) => selector(a) <= selector(b) ? a : b);
+  }
+
+  String _month(MonthlyFinancialBreakdown? item) => item == null ? '-' : DateFormat('MMM').format(item.month);
+
+  @override
+  Widget build(BuildContext context) {
+    final best = _maxBy((item) => item.cashFlow);
+    final worst = _minBy((item) => item.cashFlow);
+    final highestExpense = _maxBy((item) => item.expense);
+    final highestIncome = _maxBy((item) => item.income);
+    final highestSavings = _maxBy((item) => item.savingsNet);
+    final mostOverspent = _maxBy((item) => item.overspent);
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Monthly comparison', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              HealthStatusPill(label: 'Best ${_month(best)}', color: kSleekIncome),
+              HealthStatusPill(label: 'Worst ${_month(worst)}', color: kSleekExpense),
+              HealthStatusPill(label: 'Highest expense ${_month(highestExpense)}', color: kSleekWarning),
+              HealthStatusPill(label: 'Highest income ${_month(highestIncome)}', color: kSleekIncome),
+              HealthStatusPill(label: 'Highest savings ${_month(highestSavings)}', color: kSleekAccent),
+              HealthStatusPill(label: 'Most overspent ${_month(mostOverspent)}', color: kSleekExpense),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class YearlyBreakdownCard extends StatelessWidget {
+  const YearlyBreakdownCard({super.key, required this.summary});
+
+  final FinancialHealthSummary summary;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = summary.state;
+    final maxExpense = summary.monthlyBreakdowns.fold<double>(0, (max, item) => math.max(max, item.expense));
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Yearly breakdown', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+          const SizedBox(height: 10),
+          ...summary.monthlyBreakdowns.map((item) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: MonthBreakdownTile(item: item, maxExpense: maxExpense, state: state),
+              )),
+        ],
+      ),
+    );
+  }
+}
+
+class MonthBreakdownTile extends StatelessWidget {
+  const MonthBreakdownTile({super.key, required this.item, required this.maxExpense, required this.state});
+
+  final MonthlyFinancialBreakdown item;
+  final double maxExpense;
+  final AppController state;
+
+  @override
+  Widget build(BuildContext context) {
+    final factor = maxExpense <= 0 ? 0.0 : (item.expense / maxExpense).clamp(0.0, 1.0).toDouble();
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.42),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(.16)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              SizedBox(width: 44, child: Text(DateFormat('MMM').format(item.month), style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900))),
+              Expanded(child: Text('Income ${state.format(item.income)} • Expense ${state.format(item.expense)}', maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700))),
+              Text(state.format(item.cashFlow), style: Theme.of(context).textTheme.labelLarge?.copyWith(color: item.cashFlow >= 0 ? kSleekIncome : kSleekExpense, fontWeight: FontWeight.w900)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: Container(
+              height: 9,
+              color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.70),
+              alignment: Alignment.centerLeft,
+              child: FractionallySizedBox(widthFactor: factor, child: Container(color: kSleekExpense)),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text('Savings ${state.format(item.savingsNet)} • Loans ${state.format(item.loansGiven + item.loansTaken)} • Repayments ${state.format(item.loanRepaymentPaid + item.loanRepaymentReceived)} • Bills ${item.billPaymentCount} • Budget used ${state.format(item.budgetSpent)}', maxLines: 2, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+        ],
+      ),
+    );
+  }
+}
 
 class AnalysisTrendChart extends StatelessWidget {
   const AnalysisTrendChart({
@@ -5271,30 +9545,53 @@ class AnalysisTrendChart extends StatelessWidget {
   final Map<DateTime, Summary> daily;
   final String rangeLabel;
 
-  static const Color _incomeColor = Color(0xFF18D6E3);
-  static const Color _expenseColor = Color(0xFFFF5B57);
+  static const Color _chartCard = Color(0xFF242A35);
+  static const Color _chartPanel = Color(0xFF222832);
+  static const Color _incomeStart = Color(0xFFFF7A1A);
+  static const Color _incomeEnd = Color(0xFFFF2E2E);
+  static const Color _expenseStart = Color(0xFF8A2BFF);
+  static const Color _expenseEnd = Color(0xFFFF6CAD);
+  static const Color _axisText = Color(0xFFB7BEC9);
+  static const Color _softGrid = Color(0xFF59616E);
 
-  List<FlSpot> _spots(double Function(Summary summary) valueOf) {
+  List<FlSpot> _spotsFor(bool income) {
     if (days.isEmpty) return const [FlSpot(0, 0), FlSpot(1, 0)];
     final result = <FlSpot>[];
     for (var i = 0; i < days.length; i++) {
-      result.add(FlSpot(i.toDouble(), valueOf(daily[days[i]] ?? const Summary(income: 0, expense: 0))));
+      final summary = daily[days[i]] ?? const Summary(income: 0, expense: 0);
+      result.add(FlSpot(i.toDouble(), income ? summary.income : summary.expense));
     }
     if (result.length == 1) result.add(FlSpot(1, result.first.y));
     return result;
   }
 
-  double _maxY(List<FlSpot> income, List<FlSpot> expense) {
-    final highest = [...income, ...expense].fold<double>(0, (max, spot) => math.max(max, spot.y));
-    if (highest <= 0) return 100;
-    final padded = highest * 1.20;
+  ({double minY, double maxY}) _bounds(List<FlSpot> incomeSpots, List<FlSpot> expenseSpots) {
+    final values = <double>[
+      ...incomeSpots.map((spot) => spot.y),
+      ...expenseSpots.map((spot) => spot.y),
+    ];
+    final high = values.fold<double>(0, (max, value) => math.max(max, value));
+    if (high <= 0) return (minY: 0, maxY: 100);
+
+    final padded = high * 1.22;
     final magnitude = math.pow(10, (math.log(padded) / math.ln10).floor()).toDouble();
     final normalized = padded / magnitude;
     final rounded = normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-    return rounded * magnitude;
+    return (minY: 0, maxY: rounded * magnitude);
+  }
+
+  double _highlightX(List<FlSpot> incomeSpots, List<FlSpot> expenseSpots) {
+    final length = math.min(incomeSpots.length, expenseSpots.length);
+    for (var i = length - 1; i >= 0; i--) {
+      if (incomeSpots[i].y != 0 || expenseSpots[i].y != 0) return incomeSpots[i].x;
+    }
+    return length <= 1 ? 0 : incomeSpots.last.x;
   }
 
   String _compactCurrency(AppController state, double value) {
+    if (state.amountsHidden) {
+      return state.currencyPosition == CurrencyPosition.prefix ? '${state.currencySymbol}••••' : '••••${state.currencySymbol}';
+    }
     final absValue = value.abs();
     String number;
     if (absValue >= 1000000) {
@@ -5311,27 +9608,27 @@ class AnalysisTrendChart extends StatelessWidget {
         : '$sign$number${state.currencySymbol}';
   }
 
-  Widget _leftTitle(BuildContext context, double value, TitleMeta meta, double maxY) {
-    final allowed = [0.0, maxY / 2, maxY];
-    final match = allowed.any((v) => (value - v).abs() < 0.01);
-    if (!match) return const SizedBox.shrink();
+  Widget _leftTitle(BuildContext context, double value, TitleMeta meta, double maxY, Color axisColor) {
+    final interval = maxY / 4;
+    if (interval <= 0) return const SizedBox.shrink();
+    final roundedSlot = (value / interval).round();
+    final expected = roundedSlot * interval;
+    if ((value - expected).abs() > 0.01) return const SizedBox.shrink();
     final state = context.read<AppController>();
     return Text(
       _compactCurrency(state, value),
       style: Theme.of(context).textTheme.labelSmall?.copyWith(
-            color: Theme.of(context).colorScheme.onSurface.withOpacity(.58),
-            fontWeight: FontWeight.w700,
+            color: axisColor.withOpacity(.72),
+            fontWeight: FontWeight.w800,
           ),
     );
   }
 
-  Widget _bottomTitle(BuildContext context, double value, TitleMeta meta) {
+  Widget _bottomTitle(BuildContext context, double value, TitleMeta meta, Color axisColor) {
     if (days.isEmpty) return const SizedBox.shrink();
     final indexes = <int>{
       0,
-      if (days.length > 2) (days.length * .25).round(),
-      if (days.length > 3) (days.length * .5).round(),
-      if (days.length > 4) (days.length * .75).round(),
+      if (days.length > 2) (days.length * .5).round(),
       days.length - 1,
     }.where((i) => i >= 0 && i < days.length).toList()
       ..sort();
@@ -5339,186 +9636,255 @@ class AnalysisTrendChart extends StatelessWidget {
     final index = value.round();
     if (!indexes.contains(index)) return const SizedBox.shrink();
     final day = days[index];
+    final label = days.length > 45 ? DateFormat('MMM').format(day).toUpperCase() : DateFormat('MMM d').format(day);
     return SideTitleWidget(
       axisSide: meta.axisSide,
       space: 10,
       child: Text(
-        DateFormat('MMM d').format(day),
+        label,
         style: Theme.of(context).textTheme.labelSmall?.copyWith(
-              color: Theme.of(context).colorScheme.onSurface.withOpacity(.58),
-              fontWeight: FontWeight.w700,
+              color: axisColor.withOpacity(.78),
+              fontWeight: FontWeight.w900,
+              letterSpacing: .2,
             ),
       ),
     );
   }
 
+  List<FlSpot> _animatedSpots(List<FlSpot> spots, double animation) {
+    return spots.map((spot) => FlSpot(spot.x, spot.y * animation)).toList(growable: false);
+  }
+
   @override
   Widget build(BuildContext context) {
-    final incomeSpots = _spots((summary) => summary.income);
-    final expenseSpots = _spots((summary) => summary.expense);
-    final maxY = _maxY(incomeSpots, expenseSpots);
-    final hasData = incomeSpots.any((spot) => spot.y > 0) || expenseSpots.any((spot) => spot.y > 0);
+    final state = context.watch<AppController>();
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final chartCardColor = isDark ? _chartCard : const Color(0xFFFBFEFF);
+    final chartPanelColor = isDark ? _chartPanel : const Color(0xFFF7FCFD);
+    final titleColor = isDark ? Colors.white : scheme.onSurface;
+    final axisColor = isDark ? _axisText : scheme.onSurfaceVariant;
+    final gridColor = isDark ? _softGrid : const Color(0xFFD8E6EA);
+    final chartBorderColor = isDark ? Colors.white.withOpacity(.045) : const Color(0xFFDCEBEE);
+    final panelShadowColor = isDark ? Colors.black.withOpacity(.22) : Colors.black.withOpacity(.045);
+    final buttonBackground = isDark ? Colors.white.withOpacity(.08) : const Color(0xFFEAF3F5);
+    final buttonForeground = isDark ? Colors.white : scheme.onSurface;
+    final incomeSpots = _spotsFor(true);
+    final expenseSpots = _spotsFor(false);
+    final bounds = _bounds(incomeSpots, expenseSpots);
+    final minY = bounds.minY;
+    final maxY = bounds.maxY;
     final maxX = math.max(1.0, (days.length - 1).toDouble());
+    final highlightX = _highlightX(incomeSpots, expenseSpots).clamp(0, maxX).toDouble();
+    final hasData = incomeSpots.any((spot) => spot.y != 0) || expenseSpots.any((spot) => spot.y != 0);
 
-    return ExpressiveCard(
-      padding: const EdgeInsets.fromLTRB(16, 16, 16, 14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  'Cash Flow Trend',
-                  style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
-                ),
-              ),
-              Material(
-                color: Colors.transparent,
-                borderRadius: BorderRadius.circular(16),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(16),
-                  onTap: () => showDateRangeSheet(context),
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.58),
-                      borderRadius: BorderRadius.circular(16),
-                      border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(.16)),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          rangeLabel,
-                          style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                                color: Theme.of(context).colorScheme.onSurface.withOpacity(.86),
-                                fontWeight: FontWeight.w700,
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: const Duration(milliseconds: 720),
+      curve: Curves.easeOutCubic,
+      builder: (context, animation, child) {
+        final animatedIncome = _animatedSpots(incomeSpots, animation);
+        final animatedExpense = _animatedSpots(expenseSpots, animation);
+
+        return Opacity(
+          opacity: animation,
+          child: Transform.translate(
+            offset: Offset(0, (1 - animation) * 18),
+            child: ExpressiveCard(
+              color: chartCardColor,
+              surfaceTint: false,
+              padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Income & Expenses',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                                color: titleColor,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: -.2,
                               ),
                         ),
-                        const SizedBox(width: 6),
-                        Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: Theme.of(context).colorScheme.onSurface.withOpacity(.72)),
+                      ),
+                      IconButton.filledTonal(
+                        onPressed: () => showDateRangeSheet(context),
+                        icon: const Icon(Icons.chevron_right_rounded),
+                        style: IconButton.styleFrom(
+                          backgroundColor: buttonBackground,
+                          foregroundColor: buttonForeground,
+                        ),
+                        tooltip: 'Change date range',
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  Container(
+                    height: 300,
+                    padding: const EdgeInsets.fromLTRB(4, 8, 10, 4),
+                    decoration: BoxDecoration(
+                      color: chartPanelColor,
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: chartBorderColor),
+                      boxShadow: [
+                        BoxShadow(
+                          color: panelShadowColor,
+                          blurRadius: isDark ? 24.0 : 18.0,
+                          offset: const Offset(0, 12),
+                        ),
                       ],
                     ),
+                    child: hasData
+                        ? RepaintBoundary(
+                            child: LineChart(
+                              LineChartData(
+                              minX: 0,
+                              maxX: maxX,
+                              minY: minY,
+                              maxY: maxY,
+                              clipData: const FlClipData.all(),
+                              lineTouchData: LineTouchData(
+                                handleBuiltInTouches: true,
+                                touchTooltipData: LineTouchTooltipData(
+                                  tooltipRoundedRadius: 16,
+                                  tooltipPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                  tooltipMargin: 12,
+                                  getTooltipColor: (_) => Colors.black.withOpacity(.88),
+                                  getTooltipItems: (items) => items.map((item) {
+                                    final index = item.x.round().clamp(0, days.length - 1).toInt();
+                                    final label = item.barIndex == 0 ? 'Income' : 'Expenses';
+                                    return LineTooltipItem(
+                                      '$label\n${DateFormat('MMM d').format(days[index])}  ${_compactCurrency(state, item.y)}',
+                                      const TextStyle(
+                                        color: Colors.white,
+                                        fontWeight: FontWeight.w900,
+                                      ),
+                                    );
+                                  }).toList(),
+                                ),
+                              ),
+                              borderData: FlBorderData(show: false),
+                              gridData: FlGridData(
+                                show: true,
+                                drawVerticalLine: true,
+                                horizontalInterval: maxY / 4,
+                                verticalInterval: math.max(1, (maxX / 4).round()).toDouble(),
+                                getDrawingHorizontalLine: (value) => FlLine(
+                                  color: gridColor.withOpacity(isDark ? .20 : .44),
+                                  strokeWidth: 1,
+                                ),
+                                getDrawingVerticalLine: (value) => FlLine(
+                                  color: gridColor.withOpacity(isDark ? .16 : .34),
+                                  strokeWidth: 1,
+                                ),
+                              ),
+                              extraLinesData: ExtraLinesData(
+                                verticalLines: [
+                                  VerticalLine(
+                                    x: highlightX,
+                                    color: (isDark ? Colors.white : scheme.onSurface).withOpacity(isDark ? .34 : .42),
+                                    strokeWidth: 1.6,
+                                  ),
+                                ],
+                              ),
+                              titlesData: FlTitlesData(
+                                topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                leftTitles: AxisTitles(
+                                  sideTitles: SideTitles(
+                                    showTitles: true,
+                                    reservedSize: 58,
+                                    interval: maxY / 4,
+                                    getTitlesWidget: (value, meta) => _leftTitle(context, value, meta, maxY, axisColor),
+                                  ),
+                                ),
+                                bottomTitles: AxisTitles(
+                                  sideTitles: SideTitles(
+                                    showTitles: true,
+                                    reservedSize: 34,
+                                    interval: 1,
+                                    getTitlesWidget: (value, meta) => _bottomTitle(context, value, meta, axisColor),
+                                  ),
+                                ),
+                              ),
+                              lineBarsData: [
+                                LineChartBarData(
+                                  spots: animatedIncome,
+                                  isCurved: true,
+                                  preventCurveOverShooting: true,
+                                  barWidth: 3.6,
+                                  isStrokeCapRound: true,
+                                  gradient: const LinearGradient(colors: [_incomeStart, _incomeEnd]),
+                                  dotData: FlDotData(
+                                    show: true,
+                                    checkToShowDot: (spot, barData) => (spot.x - highlightX).abs() < .01,
+                                    getDotPainter: (spot, percent, barData, index) => FlDotCirclePainter(
+                                      radius: 6,
+                                      color: Colors.white,
+                                      strokeWidth: 3,
+                                      strokeColor: _incomeEnd,
+                                    ),
+                                  ),
+                                  belowBarData: BarAreaData(show: false),
+                                ),
+                                LineChartBarData(
+                                  spots: animatedExpense,
+                                  isCurved: true,
+                                  preventCurveOverShooting: true,
+                                  barWidth: 3.6,
+                                  isStrokeCapRound: true,
+                                  gradient: const LinearGradient(colors: [_expenseStart, _expenseEnd]),
+                                  dotData: FlDotData(
+                                    show: true,
+                                    checkToShowDot: (spot, barData) => (spot.x - highlightX).abs() < .01,
+                                    getDotPainter: (spot, percent, barData, index) => FlDotCirclePainter(
+                                      radius: 6,
+                                      color: Colors.white,
+                                      strokeWidth: 3,
+                                      strokeColor: _expenseEnd,
+                                    ),
+                                  ),
+                                  belowBarData: BarAreaData(show: false),
+                                ),
+                              ],
+                              ),
+                            ),
+                          )
+                        : Center(
+                            child: Text(
+                              'No chart data exists for this range.',
+                              style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: axisColor, fontWeight: FontWeight.w800),
+                            ),
+                          ),
                   ),
-                ),
+                  const SizedBox(height: 14),
+                  Row(
+                    children: [
+                      _TrendLegend(color: _incomeEnd, label: 'Income', textColor: titleColor),
+                      const SizedBox(width: 18),
+                      _TrendLegend(color: _expenseStart, label: 'Expenses', textColor: titleColor),
+                    ],
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
-          const SizedBox(height: 16),
-          SizedBox(
-            height: 230,
-            child: hasData
-                ? LineChart(
-                    LineChartData(
-                      minX: 0,
-                      maxX: maxX,
-                      minY: 0,
-                      maxY: maxY,
-                      clipData: const FlClipData.all(),
-                      lineTouchData: LineTouchData(
-                        handleBuiltInTouches: true,
-                        touchTooltipData: LineTouchTooltipData(
-                          tooltipRoundedRadius: 14,
-                          tooltipPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          tooltipMargin: 10,
-                          getTooltipColor: (_) => const Color(0xFF122126),
-                        ),
-                      ),
-                      borderData: FlBorderData(show: false),
-                      gridData: FlGridData(
-                        show: true,
-                        drawVerticalLine: false,
-                        horizontalInterval: maxY / 2,
-                        getDrawingHorizontalLine: (value) => FlLine(
-                          color: Theme.of(context).colorScheme.outline.withOpacity(.18),
-                          strokeWidth: 1,
-                          dashArray: const [8, 6],
-                        ),
-                      ),
-                      titlesData: FlTitlesData(
-                        topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                        rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-                        leftTitles: AxisTitles(
-                          sideTitles: SideTitles(
-                            showTitles: true,
-                            reservedSize: 46,
-                            interval: maxY / 2,
-                            getTitlesWidget: (value, meta) => _leftTitle(context, value, meta, maxY),
-                          ),
-                        ),
-                        bottomTitles: AxisTitles(
-                          sideTitles: SideTitles(
-                            showTitles: true,
-                            reservedSize: 30,
-                            interval: 1,
-                            getTitlesWidget: (value, meta) => _bottomTitle(context, value, meta),
-                          ),
-                        ),
-                      ),
-                      lineBarsData: [
-                        LineChartBarData(
-                          spots: incomeSpots,
-                          isCurved: true,
-                          barWidth: 3.2,
-                          color: _incomeColor,
-                          isStrokeCapRound: true,
-                          dotData: const FlDotData(show: false),
-                          belowBarData: BarAreaData(
-                            show: true,
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [_incomeColor.withOpacity(.22), _incomeColor.withOpacity(.02)],
-                            ),
-                          ),
-                        ),
-                        LineChartBarData(
-                          spots: expenseSpots,
-                          isCurved: true,
-                          barWidth: 3.2,
-                          color: _expenseColor,
-                          isStrokeCapRound: true,
-                          dotData: const FlDotData(show: false),
-                          belowBarData: BarAreaData(
-                            show: true,
-                            gradient: LinearGradient(
-                              begin: Alignment.topCenter,
-                              end: Alignment.bottomCenter,
-                              colors: [_expenseColor.withOpacity(.18), _expenseColor.withOpacity(.01)],
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
-                : Center(
-                    child: Text(
-                      'No chart data exists for this range.',
-                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: kSleekMuted),
-                    ),
-                  ),
-          ),
-          const SizedBox(height: 12),
-          const Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _TrendLegend(color: _incomeColor, label: 'Income'),
-              SizedBox(width: 22),
-              _TrendLegend(color: _expenseColor, label: 'Expense'),
-            ],
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
 
 class _TrendLegend extends StatelessWidget {
-  const _TrendLegend({required this.color, required this.label});
+  const _TrendLegend({required this.color, required this.label, required this.textColor});
 
   final Color color;
   final String label;
+  final Color textColor;
 
   @override
   Widget build(BuildContext context) {
@@ -5526,20 +9892,20 @@ class _TrendLegend extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         Container(
-          width: 18,
+          width: 30,
           height: 6,
           decoration: BoxDecoration(
             color: color,
             borderRadius: BorderRadius.circular(999),
-            boxShadow: [BoxShadow(color: color.withOpacity(.35), blurRadius: 8)],
+            boxShadow: [BoxShadow(color: color.withOpacity(.36), blurRadius: 10)],
           ),
         ),
         const SizedBox(width: 8),
         Text(
           label,
           style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                color: Theme.of(context).colorScheme.onSurface.withOpacity(.86),
-                fontWeight: FontWeight.w700,
+                color: textColor.withOpacity(.88),
+                fontWeight: FontWeight.w800,
               ),
         ),
       ],
@@ -5567,7 +9933,7 @@ class _CategoriesScreenState extends State<CategoriesScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SleekPillSelector<CategoryType>(
+            SleekCyclePillSelector<CategoryType>(
               options: const [
                 SleekPillOption(value: CategoryType.expense, label: 'Expense', icon: Icons.north_east_rounded),
                 SleekPillOption(value: CategoryType.income, label: 'Income', icon: Icons.south_west_rounded),
@@ -5576,7 +9942,7 @@ class _CategoriesScreenState extends State<CategoriesScreen> {
               onChanged: (v) => setState(() => selected = v),
             ),
             const SizedBox(height: 14),
-            CategoryBreakdownCard(type: selected, interactive: true),
+            CategoryBreakdownCard(key: ValueKey(selected), type: selected, interactive: true),
             const SizedBox(height: 18),
             _ManageCategoriesButton(type: selected),
           ],
@@ -5658,27 +10024,21 @@ class ManageCategoriesScreen extends StatelessWidget {
       title: 'Manage categories',
       subtitle: title,
       actions: [IconButton(onPressed: () => showCategoryEditor(context, initialType: type), icon: const Icon(Icons.add_rounded))],
-      child: ResponsiveContent(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (cats.isEmpty)
-              EmptyCard(
-                icon: Icons.category_rounded,
-                title: 'No ${enumName(type)} categories',
-                body: 'Tap the + button to create a category.',
-              )
-            else
-              ...cats.map((c) => Padding(
-                    padding: const EdgeInsets.only(bottom: 10),
-                    child: CategoryTile(
-                      category: c,
-                      trailing: const Icon(Icons.chevron_right_rounded),
-                      onTap: () => showCategoryEditor(context, category: c),
-                    ),
-                  )),
-          ],
+      child: ResponsiveListContent(
+        itemCount: cats.length,
+        empty: EmptyCard(
+          icon: Icons.category_rounded,
+          title: 'No ${enumName(type)} categories',
+          body: 'Tap the + button to create a category.',
         ),
+        itemBuilder: (context, index) {
+          final category = cats[index];
+          return CategoryTile(
+            category: category,
+            trailing: const Icon(Icons.chevron_right_rounded),
+            onTap: () => showCategoryEditor(context, category: category),
+          );
+        },
       ),
     );
   }
@@ -5692,17 +10052,66 @@ class CategoryBreakdownCard extends StatelessWidget {
 
   Color _fallbackColor(int index) {
     const palette = [
-      Color(0xFF00C7D8),
-      Color(0xFF27D17F),
-      Color(0xFFFF5353),
-      Color(0xFFF59E0B),
-      Color(0xFF8B5CF6),
-      Color(0xFF38BDF8),
-      Color(0xFFF472B6),
-      Color(0xFFA3E635),
+      Color(0xFF18D8CF),
+      Color(0xFFA79BFF),
+      Color(0xFF7EDBD3),
+      Color(0xFF1EC7BD),
+      Color(0xFFB9B1FF),
+      Color(0xFF5BE6DB),
+      Color(0xFFF7C66D),
+      Color(0xFFF49DBE),
     ];
     return palette[index % palette.length];
   }
+
+  List<_BreakdownSlice> _buildSlices(AppController state, List<MapEntry<String, double>> entries) {
+    if (entries.length <= 8) {
+      return entries.asMap().entries.map((indexed) {
+        final index = indexed.key;
+        final entry = indexed.value;
+        final category = state.categoryOf(entry.key);
+        final color = category == null ? _fallbackColor(index) : colorFromHex(category.iconColor, fallback: _fallbackColor(index));
+        return _BreakdownSlice(categoryId: entry.key, category: category, value: entry.value, color: color);
+      }).toList();
+    }
+
+    final visible = <_BreakdownSlice>[];
+    for (var i = 0; i < 7; i++) {
+      final entry = entries[i];
+      final category = state.categoryOf(entry.key);
+      final color = category == null ? _fallbackColor(i) : colorFromHex(category.iconColor, fallback: _fallbackColor(i));
+      visible.add(_BreakdownSlice(categoryId: entry.key, category: category, value: entry.value, color: color));
+    }
+    final otherValue = entries.skip(7).fold<double>(0, (sum, entry) => sum + entry.value);
+    visible.add(
+      _BreakdownSlice(
+        categoryId: '__other__',
+        category: null,
+        value: otherValue,
+        color: _fallbackColor(7),
+        labelOverride: 'Other',
+        iconNameOverride: 'category',
+      ),
+    );
+    return visible;
+  }
+
+  String _badgeTag(_BreakdownSlice slice) {
+    if (slice.label.toLowerCase() == 'other') return 'OTHER';
+    final words = slice.label
+        .split(RegExp(r'\s+'))
+        .where((w) => w.trim().isNotEmpty)
+        .toList();
+    if (words.isEmpty) return 'CAT';
+    if (words.length >= 2) {
+      return words.take(2).map((w) => w.substring(0, 1)).join().toUpperCase();
+    }
+    final word = words.first;
+    if (word.length <= 4) return word.toUpperCase();
+    return word.substring(0, 3).toUpperCase();
+  }
+
+  bool _useTextBadge(_BreakdownSlice slice) => slice.category == null;
 
   @override
   Widget build(BuildContext context) {
@@ -5721,58 +10130,301 @@ class CategoryBreakdownCard extends StatelessWidget {
       );
     }
 
+    final slices = _buildSlices(state, entries);
+    final chartTitle = type == CategoryType.expense ? 'Expense breakdown' : 'Income breakdown';
+    final rangeLabel = state.activeRange().label;
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final chartSurfaceTop = isDark ? scheme.surfaceContainerHighest.withOpacity(.18) : const Color(0xFFF7FCFD);
+    final chartSurfaceBottom = isDark ? scheme.surfaceContainerHigh.withOpacity(.06) : Colors.white;
+    final chartBorderColor = isDark ? Colors.transparent : const Color(0xFFDCEBEE).withOpacity(.95);
+    final donutTrackColor = isDark ? const Color(0xFF26383C).withOpacity(.36) : const Color(0xFFE1ECEF);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         ExpressiveCard(
-          child: SizedBox(
-            height: 250,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                PieChart(
-                  PieChartData(
-                    sectionsSpace: 3,
-                    centerSpaceRadius: 62,
-                    startDegreeOffset: -90,
-                    sections: [
-                      for (var i = 0; i < entries.length; i++)
-                        PieChartSectionData(
-                          value: entries[i].value,
-                          title: entries[i].value / total >= .08 ? '${((entries[i].value / total) * 100).toStringAsFixed(0)}%' : '',
-                          titleStyle: Theme.of(context).textTheme.labelLarge?.copyWith(color: Colors.white, fontWeight: FontWeight.w900),
-                          radius: 30,
-                          color: state.categoryOf(entries[i].key) == null
-                              ? _fallbackColor(i)
-                              : colorFromHex(state.categoryOf(entries[i].key)!.iconColor, fallback: _fallbackColor(i)),
+          padding: const EdgeInsets.fromLTRB(18, 18, 18, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          chartTitle,
+                          style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900),
                         ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      state.format(total),
-                      style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900),
+                  const SizedBox(width: 12),
+                  Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      borderRadius: BorderRadius.circular(999),
+                      onTap: () => showDateRangeSheet(context),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: isDark ? scheme.surfaceContainerHigh.withOpacity(.88) : const Color(0xFFEAF3F5).withOpacity(.94),
+                          borderRadius: BorderRadius.circular(999),
+                          border: Border.all(color: isDark ? scheme.outline.withOpacity(.16) : const Color(0xFFD8E7EA)),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              rangeLabel,
+                              style: Theme.of(context).textTheme.labelLarge?.copyWith(fontWeight: FontWeight.w800),
+                            ),
+                            const SizedBox(width: 4),
+                            Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: scheme.onSurfaceVariant),
+                          ],
+                        ),
+                      ),
                     ),
-                    Text(
-                      'Total',
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w800),
-                    ),
-                  ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                height: 334,
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    final canvasWidth = constraints.maxWidth;
+                    const canvasHeight = 334.0;
+                    final chartSize = math.min(math.max(180.0, canvasWidth - 98), math.min(268.0, canvasWidth - 8));
+                    final centerSize = chartSize * .57;
+                    final manyBadges = slices.length > 5;
+                    final badgeWidth = manyBadges ? (canvasWidth < 360 ? 78.0 : 86.0) : (canvasWidth < 360 ? 84.0 : 94.0);
+                    final badgeHeight = manyBadges ? 40.0 : 44.0;
+                    final badgeOrbit = (chartSize / 2) + (manyBadges ? 32.0 : 24.0);
+
+                    double startAngle = -90;
+                    final badgeAngles = <double>[];
+                    for (final slice in slices) {
+                      final sweep = total == 0 ? 0 : (slice.value / total) * 360;
+                      badgeAngles.add(startAngle + (sweep / 2));
+                      startAngle += sweep;
+                    }
+
+                    final badgeNudges = List<double>.filled(slices.length, 0);
+                    void spreadDenseSide(bool leftSide) {
+                      final indexes = <int>[];
+                      for (var i = 0; i < badgeAngles.length; i++) {
+                        final radians = badgeAngles[i] * (math.pi / 180);
+                        final isLeft = math.cos(radians) < -0.18;
+                        if (isLeft == leftSide) indexes.add(i);
+                      }
+                      if (indexes.length <= 1) return;
+                      indexes.sort((a, b) {
+                        final ay = math.sin(badgeAngles[a] * (math.pi / 180));
+                        final by = math.sin(badgeAngles[b] * (math.pi / 180));
+                        return ay.compareTo(by);
+                      });
+                      final spacing = manyBadges ? 11.0 : 8.0;
+                      for (var rank = 0; rank < indexes.length; rank++) {
+                        badgeNudges[indexes[rank]] = (rank - ((indexes.length - 1) / 2)) * spacing;
+                      }
+                    }
+
+                    spreadDenseSide(true);
+                    spreadDenseSide(false);
+
+                    int? selectedBadgeIndex;
+
+                    return StatefulBuilder(
+                      builder: (context, setBadgeState) {
+                        return TweenAnimationBuilder<double>(
+                      key: ValueKey('${type.name}-${slices.length}-${total.toStringAsFixed(2)}'),
+                      tween: Tween<double>(begin: 0, end: 1),
+                      duration: const Duration(milliseconds: 680),
+                      curve: Curves.easeOutCubic,
+                      builder: (context, progress, _) {
+                        final badgeProgress = ((progress - .35) / .65).clamp(0.0, 1.0).toDouble();
+                        final centerProgress = ((progress - .18) / .82).clamp(0.0, 1.0).toDouble();
+                        final badgeOrder = List<int>.generate(slices.length, (index) => index);
+                        if (selectedBadgeIndex != null && selectedBadgeIndex! >= 0 && selectedBadgeIndex! < slices.length) {
+                          badgeOrder
+                            ..remove(selectedBadgeIndex)
+                            ..add(selectedBadgeIndex!);
+                        }
+
+                        return Stack(
+                          alignment: Alignment.center,
+                          clipBehavior: Clip.hardEdge,
+                          children: [
+                            Positioned.fill(
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(34),
+                                  gradient: LinearGradient(
+                                    begin: Alignment.topCenter,
+                                    end: Alignment.bottomCenter,
+                                    colors: [
+                                      chartSurfaceTop,
+                                      chartSurfaceBottom,
+                                    ],
+                                  ),
+                                  border: Border.all(color: chartBorderColor, width: isDark ? 0.0 : 1.0),
+                                  boxShadow: isDark
+                                      ? null
+                                      : [
+                                          BoxShadow(
+                                            color: Colors.black.withOpacity(.035),
+                                            blurRadius: 18,
+                                            offset: const Offset(0, 8),
+                                          ),
+                                        ],
+                                ),
+                              ),
+                            ),
+                            Center(
+                              child: SizedBox(
+                                width: chartSize,
+                                height: chartSize,
+                                child: RepaintBoundary(
+                                  child: CustomPaint(
+                                    isComplex: true,
+                                    willChange: progress < 1,
+                                    painter: _ExpressiveDonutPainter(slices: slices, total: total, progress: progress, trackColor: donutTrackColor),
+                                  ),
+                                ),
+                              ),
+                            ),
+                            for (final i in badgeOrder)
+                              _DonutBadgePositioned(
+                                angleDegrees: badgeAngles[i],
+                                orbit: badgeOrbit,
+                                canvasWidth: canvasWidth,
+                                canvasHeight: canvasHeight,
+                                badgeWidth: selectedBadgeIndex == i ? badgeWidth + 12 : badgeWidth,
+                                badgeHeight: selectedBadgeIndex == i ? badgeHeight + 4 : badgeHeight,
+                                verticalNudge: badgeNudges[i],
+                                child: GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    setBadgeState(() {
+                                      selectedBadgeIndex = selectedBadgeIndex == i ? null : i;
+                                    });
+                                  },
+                                  child: Opacity(
+                                    opacity: badgeProgress,
+                                    child: Transform.scale(
+                                      scale: (.86 + (.14 * badgeProgress)) * (selectedBadgeIndex == i ? 1.08 : 1.0),
+                                      child: _DonutPercentBadge(
+                                        color: slices[i].color,
+                                        iconName: slices[i].iconName,
+                                        label: total <= 0 ? '0%' : '${((slices[i].value / total) * 100).round()}%',
+                                        leadingText: _badgeTag(slices[i]),
+                                        useTextBadge: _useTextBadge(slices[i]),
+                                        selected: selectedBadgeIndex == i,
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            Center(
+                              child: Opacity(
+                                opacity: centerProgress,
+                                child: Transform.scale(
+                                  scale: .92 + (.08 * centerProgress),
+                                  child: Container(
+                                    width: centerSize,
+                                    height: centerSize,
+                                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                                    decoration: BoxDecoration(
+                                      color: isDark ? const Color(0xFF111417).withOpacity(.97) : Colors.white.withOpacity(.98),
+                                      shape: BoxShape.circle,
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(isDark ? .22 : .08),
+                                          blurRadius: isDark ? 22.0 : 18.0,
+                                          offset: const Offset(0, 10),
+                                        ),
+                                      ],
+                                      border: Border.all(
+                                        color: isDark ? scheme.outline.withOpacity(.10) : const Color(0xFFD7E6E9),
+                                      ),
+                                    ),
+                                    child: Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Flexible(
+                                          flex: 3,
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            child: Text(
+                                              state.format(total),
+                                              maxLines: 1,
+                                              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                                                    fontWeight: FontWeight.w900,
+                                                    letterSpacing: -.8,
+                                                    color: isDark ? Colors.white : scheme.onSurface,
+                                                  ),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 5),
+                                        Flexible(
+                                          flex: 2,
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            child: Text(
+                                              type == CategoryType.expense ? 'Total expense' : 'Total income',
+                                              maxLines: 1,
+                                              textAlign: TextAlign.center,
+                                              style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                                                    color: const Color(0xFF10CADA),
+                                                    fontWeight: FontWeight.w900,
+                                                  ),
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(height: 3),
+                                        Flexible(
+                                          flex: 2,
+                                          child: FittedBox(
+                                            fit: BoxFit.scaleDown,
+                                            child: Text(
+                                              rangeLabel,
+                                              maxLines: 1,
+                                              textAlign: TextAlign.center,
+                                              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                                                    color: isDark ? Colors.white.withOpacity(.82) : scheme.onSurfaceVariant.withOpacity(.88),
+                                                    fontWeight: FontWeight.w800,
+                                                  ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        );
+                      },
+                        );
+                      },
+                    );
+                  },
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
         const SizedBox(height: 12),
-        ...entries.asMap().entries.map((indexed) {
-          final index = indexed.key;
-          final entry = indexed.value;
-          final category = state.categoryOf(entry.key);
-          final color = category == null ? _fallbackColor(index) : colorFromHex(category.iconColor, fallback: _fallbackColor(index));
-          final percentage = total <= 0 ? 0.0 : (entry.value / total) * 100;
+        ...slices.asMap().entries.map((indexed) {
+          final slice = indexed.value;
+          final color = slice.color;
+          final percentage = total <= 0 ? 0.0 : (slice.value / total) * 100;
 
           return Padding(
             padding: const EdgeInsets.only(bottom: 10),
@@ -5782,24 +10434,24 @@ class CategoryBreakdownCard extends StatelessWidget {
                 color: Colors.transparent,
                 child: InkWell(
                   borderRadius: BorderRadius.circular(18),
-                  onTap: interactive && category != null
+                  onTap: interactive && slice.category != null
                       ? () => Navigator.push(
                             context,
-                            MaterialPageRoute(builder: (_) => CategoryTransactionScreen(category: category)),
+                            MaterialPageRoute(builder: (_) => CategoryTransactionScreen(category: slice.category!)),
                           )
                       : null,
                   child: Padding(
                     padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 2),
                     child: Row(
                       children: [
-                        iconBubble(context, category?.iconName ?? 'category', colorToHex(color), size: 50),
+                        iconBubble(context, slice.iconName, colorToHex(color), size: 50),
                         const SizedBox(width: 14),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
                               Text(
-                                category?.name ?? 'Unknown',
+                                slice.label,
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
@@ -5814,10 +10466,10 @@ class CategoryBreakdownCard extends StatelessWidget {
                         ),
                         const SizedBox(width: 12),
                         Text(
-                          state.format(entry.value),
+                          state.format(slice.value),
                           style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
                         ),
-                        if (interactive && category != null) ...[
+                        if (interactive && slice.category != null) ...[
                           const SizedBox(width: 8),
                           Icon(Icons.chevron_right_rounded, color: Theme.of(context).colorScheme.onSurfaceVariant),
                         ],
@@ -5834,6 +10486,216 @@ class CategoryBreakdownCard extends StatelessWidget {
   }
 }
 
+class _BreakdownSlice {
+  const _BreakdownSlice({
+    required this.categoryId,
+    required this.category,
+    required this.value,
+    required this.color,
+    this.labelOverride,
+    this.iconNameOverride,
+  });
+
+  final String categoryId;
+  final Category? category;
+  final double value;
+  final Color color;
+  final String? labelOverride;
+  final String? iconNameOverride;
+
+  String get label => labelOverride ?? category?.name ?? 'Unknown';
+  String get iconName => iconNameOverride ?? category?.iconName ?? 'category';
+}
+
+class _ExpressiveDonutPainter extends CustomPainter {
+  const _ExpressiveDonutPainter({required this.slices, required this.total, required this.progress, required this.trackColor});
+
+  final List<_BreakdownSlice> slices;
+  final double total;
+  final double progress;
+  final Color trackColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final strokeWidth = size.shortestSide * .125;
+    final radius = (size.shortestSide - strokeWidth) / 2 - 3;
+    final rect = Rect.fromCircle(center: center, radius: radius);
+
+    final trackPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.butt
+      ..color = trackColor;
+    canvas.drawCircle(center, radius, trackPaint);
+
+    if (total <= 0) return;
+
+    var start = -math.pi / 2;
+    for (final slice in slices) {
+      final sweep = (slice.value / total) * math.pi * 2;
+      final animatedSweep = sweep * progress;
+      if (animatedSweep <= 0) {
+        start += sweep;
+        continue;
+      }
+      final gap = animatedSweep > .08 ? .025 : 0.0;
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = strokeWidth
+        ..strokeCap = StrokeCap.butt
+        ..color = slice.color;
+      canvas.drawArc(rect, start + (gap / 2), math.max(0, animatedSweep - gap), false, paint);
+      start += sweep;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _ExpressiveDonutPainter oldDelegate) {
+    return oldDelegate.slices != slices || oldDelegate.total != total || oldDelegate.progress != progress || oldDelegate.trackColor != trackColor;
+  }
+}
+
+class _DonutBadgePositioned extends StatelessWidget {
+  const _DonutBadgePositioned({
+    required this.angleDegrees,
+    required this.orbit,
+    required this.canvasWidth,
+    required this.canvasHeight,
+    required this.badgeWidth,
+    required this.badgeHeight,
+    this.verticalNudge = 0,
+    required this.child,
+  });
+
+  final double angleDegrees;
+  final double orbit;
+  final double canvasWidth;
+  final double canvasHeight;
+  final double badgeWidth;
+  final double badgeHeight;
+  final double verticalNudge;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final radians = angleDegrees * (math.pi / 180);
+    final center = Offset(canvasWidth / 2, canvasHeight / 2);
+    final rawLeft = center.dx + math.cos(radians) * orbit - (badgeWidth / 2);
+    final rawTop = center.dy + math.sin(radians) * orbit - (badgeHeight / 2) + verticalNudge;
+    final left = rawLeft.clamp(0.0, math.max(0.0, canvasWidth - badgeWidth)).toDouble();
+    final top = rawTop.clamp(0.0, math.max(0.0, canvasHeight - badgeHeight)).toDouble();
+
+    return Positioned(
+      left: left,
+      top: top,
+      width: badgeWidth,
+      height: badgeHeight,
+      child: child,
+    );
+  }
+}
+
+class _DonutPercentBadge extends StatelessWidget {
+  const _DonutPercentBadge({
+    required this.color,
+    required this.iconName,
+    required this.label,
+    required this.leadingText,
+    required this.useTextBadge,
+    this.selected = false,
+  });
+
+  final Color color;
+  final String iconName;
+  final String label;
+  final String leadingText;
+  final bool useTextBadge;
+  final bool selected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final badgeBackground = selected
+        ? (isDark ? color.withOpacity(.28) : color.withOpacity(.20))
+        : (isDark ? const Color(0xFF181B1F).withOpacity(.96) : Colors.white.withOpacity(.96));
+    final badgeBorder = selected ? color.withOpacity(isDark ? .88 : .72) : (isDark ? Colors.white.withOpacity(.05) : const Color(0xFFD8E6EA));
+    final textColor = isDark ? Colors.white.withOpacity(.96) : scheme.onSurface;
+    final iconBackground = useTextBadge
+        ? (isDark ? Colors.black : const Color(0xFFF3F8F9))
+        : color.withOpacity(isDark ? .18 : .16);
+    final iconBorder = useTextBadge
+        ? (isDark ? Colors.white.withOpacity(.06) : const Color(0xFFDCEBED))
+        : color.withOpacity(isDark ? .28 : .30);
+    final iconColor = isDark ? Colors.white : color;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 6),
+      decoration: BoxDecoration(
+        color: badgeBackground,
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: badgeBorder, width: selected ? 2.0 : 1.0),
+        boxShadow: [
+          BoxShadow(
+            color: selected ? color.withOpacity(isDark ? .34 : .22) : Colors.black.withOpacity(isDark ? .26 : .10),
+            blurRadius: selected ? 22.0 : (isDark ? 18.0 : 14.0),
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 28,
+            height: 28,
+            decoration: BoxDecoration(
+              color: iconBackground,
+              shape: BoxShape.circle,
+              border: Border.all(color: iconBorder),
+            ),
+            child: Center(
+              child: useTextBadge
+                  ? FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 5),
+                        child: Text(
+                          leadingText,
+                          maxLines: 1,
+                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                color: textColor,
+                                fontWeight: FontWeight.w900,
+                                letterSpacing: .4,
+                              ),
+                        ),
+                      ),
+                    )
+                  : iconGlyph(context, iconName, color: iconColor, size: 15, imageBackground: Colors.white.withOpacity(.90)),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                label,
+                maxLines: 1,
+                style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: -.2,
+                      color: textColor,
+                    ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
 
 class CategoryTransactionScreen extends StatelessWidget {
   const CategoryTransactionScreen({super.key, required this.category});
@@ -5847,7 +10709,11 @@ class CategoryTransactionScreen extends StatelessWidget {
       title: category.name,
       subtitle: '${txs.length} transactions',
       actions: [IconButton(onPressed: () => showTransactionEditor(context, lockedCategory: category), icon: const Icon(Icons.add_rounded))],
-      child: ResponsiveContent(child: Column(children: txs.map((tx) => Padding(padding: const EdgeInsets.only(bottom: 10), child: TransactionTile(tx: tx))).toList())),
+      child: ResponsiveListContent(
+        itemCount: txs.length,
+        empty: const EmptyCard(icon: Icons.receipt_long_rounded, title: 'No transactions', body: 'Transactions for this category will appear here.'),
+        itemBuilder: (context, index) => TransactionTile(tx: txs[index]),
+      ),
     );
   }
 }
@@ -5950,7 +10816,12 @@ class BudgetDetailScreen extends StatelessWidget {
 }
 
 Future<void> showBudgetEditor(BuildContext context, {Budget? budget}) async {
-  await showModalBottomSheet(context: context, isScrollControlled: true, showDragHandle: true, builder: (_) => BudgetEditor(budget: budget));
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 700,
+    child: BudgetEditor(budget: budget),
+  );
 }
 
 class BudgetEditor extends StatefulWidget {
@@ -5987,7 +10858,7 @@ class _BudgetEditorState extends State<BudgetEditor> {
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -6036,12 +10907,23 @@ class LoansScreen extends StatefulWidget {
 class _LoansScreenState extends State<LoansScreen> {
   LoanType type = LoanType.given;
   bool completed = false;
+  bool _loadedInitialType = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (!_loadedInitialType) {
+      type = context.read<AppController>().activeLoanType;
+      _loadedInitialType = true;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     final visible = state.loans.where((l) => l.type == type && (completed ? l.isCompleted : !l.isCompleted)).toList();
     final typeLoans = state.loans.where((l) => l.type == type).toList();
+    final reminderItems = state.loanRepaymentReminders.where((r) => !r.isPaid && state.loanOf(r.loanId)?.type == type).toList()..sort((a, b) => a.dueDate.compareTo(b.dueDate));
     final totalPrincipal = typeLoans.fold<double>(0, (s, l) => s + l.amount);
     final totalRepaid = typeLoans.fold<double>(0, (s, l) => s + l.repaidAmount);
     final totalRemaining = typeLoans.fold<double>(0, (s, l) => s + l.remainingAmount);
@@ -6052,7 +10934,7 @@ class _LoansScreenState extends State<LoansScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            SleekPillSelector<LoanType>(
+            SleekCyclePillSelector<LoanType>(
               options: const [
                 SleekPillOption(value: LoanType.given, label: 'Given', icon: Icons.call_made_rounded),
                 SleekPillOption(value: LoanType.taken, label: 'Taken', icon: Icons.call_received_rounded),
@@ -6064,7 +10946,7 @@ class _LoansScreenState extends State<LoansScreen> {
               },
             ),
             const SizedBox(height: 10),
-            SleekPillSelector<bool>(
+            SleekCyclePillSelector<bool>(
               options: const [
                 SleekPillOption(value: false, label: 'Open', icon: Icons.pending_actions_rounded),
                 SleekPillOption(value: true, label: 'Completed', icon: Icons.check_circle_rounded),
@@ -6088,6 +10970,22 @@ class _LoansScreenState extends State<LoansScreen> {
                 Expanded(child: LoanSummaryMetric(label: 'Completed', value: '${typeLoans.where((e) => e.isCompleted).length}', icon: Icons.check_circle_rounded)),
               ]),
             ])),
+            if (reminderItems.isNotEmpty) ...[
+              const SectionHeader('Repayment reminders'),
+              ...reminderItems.take(3).map((reminder) {
+                final loan = state.loanOf(reminder.loanId);
+                if (loan == null) return const SizedBox.shrink();
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 10),
+                  child: LoanReminderTile(
+                    loan: loan,
+                    reminder: reminder,
+                    onPaid: () => state.markLoanRepaymentReminderPaid(loan, reminder, reminder.accountId.isNotEmpty ? reminder.accountId : loan.accountId),
+                    onDelete: () => state.deleteLoanRepaymentReminder(reminder.id),
+                  ),
+                );
+              }),
+            ],
             const SectionHeader('Loan records'),
             if (visible.isEmpty)
               const EmptyCard(
@@ -6166,8 +11064,14 @@ class LoanTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
     final progress = loan.amount <= 0 ? 0.0 : loan.repaidAmount / loan.amount;
-    final accent = loan.type == LoanType.given ? const Color(0xFFFF7A7A) : const Color(0xFF38BDF8);
+    final reminders = state.loanRemindersFor(loan.id);
+    final overdue = reminders.any((r) => r.isOverdue);
+    final nextReminder = reminders.where((r) => !r.isPaid).toList()..sort((a, b) => a.dueDate.compareTo(b.dueDate));
+    final accent = overdue ? kSleekExpense : (loan.type == LoanType.given ? const Color(0xFFFF7A7A) : const Color(0xFF38BDF8));
     return ExpressiveCard(
+      color: overdue
+          ? (Theme.of(context).brightness == Brightness.dark ? const Color(0xFF2A1719) : const Color(0xFFFFF0F0))
+          : null,
       child: InkWell(
         borderRadius: BorderRadius.circular(22),
         onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => LoanDetailScreen(loanId: loan.id))),
@@ -6184,7 +11088,7 @@ class LoanTile extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.end,
                 children: [
                   Text(state.format(loan.remainingAmount), style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900)),
-                  Text(loan.isCompleted ? 'Completed' : 'Open', style: Theme.of(context).textTheme.labelSmall?.copyWith(color: loan.isCompleted ? kSleekIncome : kSleekAccent, fontWeight: FontWeight.w900)),
+                  Text(overdue ? 'Overdue' : (loan.isCompleted ? 'Completed' : 'Open'), style: Theme.of(context).textTheme.labelSmall?.copyWith(color: overdue ? kSleekExpense : (loan.isCompleted ? kSleekIncome : kSleekAccent), fontWeight: FontWeight.w900)),
                 ],
               ),
             ]),
@@ -6205,6 +11109,15 @@ class LoanTile extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
             ),
+            if (nextReminder.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                '${nextReminder.first.isOverdue ? 'Overdue' : 'Next repayment'}: ${state.format(nextReminder.first.amount)} • ${DateFormat('MMM d, yyyy').format(nextReminder.first.dueDate)}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(color: nextReminder.first.isOverdue ? kSleekExpense : kSleekWarning, fontWeight: FontWeight.w900),
+              ),
+            ],
             const SizedBox(height: 4),
             Text(
               '${loan.type == LoanType.given ? 'Paid from' : 'Received into'}: ${state.accountOf(loan.accountId)?.name ?? 'Unknown account'}',
@@ -6233,6 +11146,8 @@ class LoanDetailScreen extends StatelessWidget {
       future: state.database.repayments(loan.id),
       builder: (context, snapshot) {
         final repayments = snapshot.data ?? [];
+        final reminders = state.loanRemindersFor(loan.id);
+        final pendingReminders = reminders.where((r) => !r.isPaid).toList()..sort((a, b) => a.dueDate.compareTo(b.dueDate));
         return PageScaffold(
           title: loan.personName,
           subtitle: loan.type == LoanType.given ? 'Given loan' : 'Taken loan',
@@ -6252,6 +11167,19 @@ class LoanDetailScreen extends StatelessWidget {
                   _detailRow('Due date', loan.dueDate == null ? 'Not set' : DateFormat('MMM d, yyyy').format(loan.dueDate!)),
                   _detailRow('Notes', loan.notes.isEmpty ? 'No notes' : loan.notes),
                 ])),
+                const SectionHeader('Repayment reminders'),
+                if (pendingReminders.isEmpty)
+                  const EmptyCard(icon: Icons.notifications_active_rounded, title: 'No repayment reminders', body: 'Add repayment dates while creating or editing this loan.')
+                else
+                  ...pendingReminders.map((r) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: LoanReminderTile(
+                          loan: loan,
+                          reminder: r,
+                          onPaid: () => state.markLoanRepaymentReminderPaid(loan, r, r.accountId.isNotEmpty ? r.accountId : loan.accountId),
+                          onDelete: () => state.deleteLoanRepaymentReminder(r.id),
+                        ),
+                      )),
                 const SectionHeader('Repayment history'),
                 if (repayments.isEmpty) const EmptyCard(icon: Icons.history_rounded, title: 'No repayments', body: 'Repayment records will appear here.') else ...repayments.map((r) => Padding(padding: const EdgeInsets.only(bottom: 10), child: ExpressiveCard(padding: const EdgeInsets.all(12), child: ListTile(contentPadding: EdgeInsets.zero, leading: const Icon(Icons.payments_rounded), title: Text(state.format(r.amount), style: const TextStyle(fontWeight: FontWeight.w900)), subtitle: Text('${DateFormat('MMM d, yyyy').format(r.paidOn)} • ${state.accountOf(r.accountId.isNotEmpty ? r.accountId : loan.accountId)?.name ?? 'Unknown account'}${r.notes.isEmpty ? '' : ' • ${r.notes}'}'), trailing: IconButton(icon: const Icon(Icons.delete_outline_rounded), onPressed: () => state.deleteRepayment(r.id))))))
               ],
@@ -6269,7 +11197,12 @@ class LoanDetailScreen extends StatelessWidget {
 }
 
 Future<void> showLoanEditor(BuildContext context, {Loan? loan, LoanType initialType = LoanType.given}) async {
-  await showModalBottomSheet(context: context, isScrollControlled: true, showDragHandle: true, builder: (_) => LoanEditor(loan: loan, initialType: initialType));
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 700,
+    child: LoanEditor(loan: loan, initialType: initialType),
+  );
 }
 
 class LoanEditor extends StatefulWidget {
@@ -6289,6 +11222,7 @@ class _LoanEditorState extends State<LoanEditor> {
   String? accountId;
   DateTime loanDate = DateTime.now();
   DateTime? dueDate;
+  final List<_LoanReminderDraft> reminderDrafts = [];
 
   @override
   void initState() {
@@ -6303,17 +11237,33 @@ class _LoanEditorState extends State<LoanEditor> {
       accountId = loan.accountId;
       loanDate = loan.loanDate;
       dueDate = loan.dueDate;
+      reminderDrafts.addAll(state.loanRemindersFor(loan.id).where((r) => !r.isPaid).map((r) => _LoanReminderDraft.fromReminder(r)));
     } else {
       type = widget.initialType;
-      accountId = state.defaultAccountId ?? state.accounts.firstOrNull?.id;
+      accountId = state.defaultAccountId ?? state.operatingAccounts.firstOrNull?.id;
     }
+    if (reminderDrafts.isEmpty && dueDate != null) {
+      reminderDrafts.add(_LoanReminderDraft(amount: amount.text.isEmpty ? '0' : amount.text, dueDate: dueDate!, reminderTimeMinutes: 9 * 60, notes: ''));
+    }
+  }
+
+  @override
+  void dispose() {
+    person.dispose();
+    amount.dispose();
+    notes.dispose();
+    for (final draft in reminderDrafts) {
+      draft.dispose();
+    }
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
+    final accountOptions = state.operatingAccounts.isEmpty ? state.accounts : state.operatingAccounts;
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -6336,14 +11286,14 @@ class _LoanEditorState extends State<LoanEditor> {
             const SizedBox(height: 12),
             AppleSelectionField(
               label: type == LoanType.given ? 'Paid from account' : 'Receive money into account',
-              option: state.accounts.where((a) => a.id == accountId).firstOrNull == null ? null : optionFromAccount(state.accounts.where((a) => a.id == accountId).first, state),
+              option: accountOptions.where((a) => a.id == accountId).firstOrNull == null ? null : optionFromAccount(accountOptions.where((a) => a.id == accountId).first, state),
               emptyText: 'Choose account',
               onTap: () async {
                 final selected = await showAppleWheelSelectionSheet(
                   context,
                   title: type == LoanType.given ? 'Choose Paid From Account' : 'Choose Receiving Account',
                   selectedId: accountId,
-                  options: state.accounts.map((a) => optionFromAccount(a, state)).toList(),
+                  options: accountOptions.map((a) => optionFromAccount(a, state)).toList(),
                 );
                 if (selected != null) setState(() => accountId = selected);
               },
@@ -6363,6 +11313,44 @@ class _LoanEditorState extends State<LoanEditor> {
             ]),
             const SizedBox(height: 12),
             TextField(controller: notes, minLines: 1, maxLines: 3, decoration: const InputDecoration(labelText: 'Notes')),
+            const SizedBox(height: 14),
+            ExpressiveCard(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(child: Text('Repayment reminders', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900))),
+                      IconButton(
+                        onPressed: () => setState(() => reminderDrafts.add(_LoanReminderDraft(amount: amount.text.isEmpty ? '0' : amount.text, dueDate: dueDate ?? loanDate.add(const Duration(days: 30)), reminderTimeMinutes: 9 * 60, notes: ''))),
+                        icon: const Icon(Icons.add_alert_rounded),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    type == LoanType.given
+                        ? 'Schedule expected repayments you should receive from the borrower.'
+                        : 'Schedule repayments you need to pay back to the lender.',
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 10),
+                  if (reminderDrafts.isEmpty)
+                    const Text('No repayment reminders added yet.')
+                  else
+                    ...reminderDrafts.asMap().entries.map((entry) => _LoanReminderDraftTile(
+                          draft: entry.value,
+                          index: entry.key,
+                          onChanged: () => setState(() {}),
+                          onRemove: () => setState(() {
+                            final removed = reminderDrafts.removeAt(entry.key);
+                            removed.dispose();
+                          }),
+                        )),
+                ],
+              ),
+            ),
             const SizedBox(height: 18),
             Row(children: [
               if (widget.loan != null) Expanded(child: OutlinedButton(onPressed: () async { await state.deleteLoan(widget.loan!.id); if (context.mounted) Navigator.pop(context); }, child: const Text('Delete'))),
@@ -6371,8 +11359,14 @@ class _LoanEditorState extends State<LoanEditor> {
                 final value = double.tryParse(amount.text) ?? 0;
                 if (value <= 0 || person.text.trim().isEmpty || accountId == null) return;
                 final now = DateTime.now();
-                final loan = Loan(id: widget.loan?.id ?? _uuid.v4(), type: type, accountId: accountId!, personName: person.text.trim(), amount: value, loanDate: loanDate, dueDate: dueDate, notes: notes.text.trim(), repaidAmount: widget.loan?.repaidAmount ?? 0, status: widget.loan?.status ?? LoanStatus.open, createdOn: widget.loan?.createdOn ?? now, updatedOn: now);
+                final loanId = widget.loan?.id ?? _uuid.v4();
+                final loan = Loan(id: loanId, type: type, accountId: accountId!, personName: person.text.trim(), amount: value, loanDate: loanDate, dueDate: dueDate, notes: notes.text.trim(), repaidAmount: widget.loan?.repaidAmount ?? 0, status: widget.loan?.status ?? LoanStatus.open, createdOn: widget.loan?.createdOn ?? now, updatedOn: now);
                 if (widget.loan == null) { await state.addLoan(loan); } else { await state.updateLoan(loan); }
+                final reminders = reminderDrafts
+                    .where((draft) => (double.tryParse(draft.amount.text) ?? 0) > 0)
+                    .map((draft) => draft.toReminder(loanId: loan.id, accountId: accountId!, now: now))
+                    .toList();
+                await state.replaceLoanRepaymentReminders(loan.id, reminders);
                 if (context.mounted) Navigator.pop(context);
               }, child: const Text('Save'))),
             ]),
@@ -6383,8 +11377,146 @@ class _LoanEditorState extends State<LoanEditor> {
   }
 }
 
+
+class LoanReminderTile extends StatelessWidget {
+  const LoanReminderTile({super.key, required this.loan, required this.reminder, required this.onPaid, required this.onDelete});
+  final Loan loan;
+  final LoanRepaymentReminder reminder;
+  final VoidCallback onPaid;
+  final VoidCallback onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppController>();
+    final overdue = reminder.isOverdue;
+    final dueToday = reminder.isDueToday;
+    final accent = overdue ? kSleekExpense : (dueToday ? kSleekWarning : kSleekAccent);
+    final label = overdue ? 'Overdue' : (dueToday ? 'Due today' : 'Upcoming');
+    final direction = loan.type == LoanType.given ? 'Expected repayment received' : 'Repayment to pay';
+    return ExpressiveCard(
+      color: overdue
+          ? (Theme.of(context).brightness == Brightness.dark ? const Color(0xFF2A1719) : const Color(0xFFFFF0F0))
+          : null,
+      padding: const EdgeInsets.all(14),
+      child: Row(
+        children: [
+          iconBubble(context, overdue ? 'warning' : 'reminder', colorToHex(accent), size: 48),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('${state.format(reminder.amount)} • $label', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900, color: overdue ? kSleekExpense : null)),
+                const SizedBox(height: 3),
+                Text('$direction • ${DateFormat('MMM d, yyyy').format(reminder.dueDate)} • ${_formatMinutesAsTime(reminder.reminderTimeMinutes)}', maxLines: 2, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                if (reminder.notes.isNotEmpty) ...[
+                  const SizedBox(height: 2),
+                  Text(reminder.notes, maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.bodySmall),
+                ],
+              ],
+            ),
+          ),
+          IconButton(onPressed: onPaid, icon: const Icon(Icons.check_circle_rounded), tooltip: 'Mark paid'),
+          IconButton(onPressed: onDelete, icon: const Icon(Icons.delete_outline_rounded), tooltip: 'Delete reminder'),
+        ],
+      ),
+    );
+  }
+}
+
+class _LoanReminderDraft {
+  _LoanReminderDraft({required String amount, required this.dueDate, required this.reminderTimeMinutes, required String notes})
+      : id = _uuid.v4(),
+        amount = TextEditingController(text: amount),
+        notes = TextEditingController(text: notes);
+
+  _LoanReminderDraft.fromReminder(LoanRepaymentReminder reminder)
+      : id = reminder.id,
+        amount = TextEditingController(text: reminder.amount.toStringAsFixed(2)),
+        dueDate = reminder.dueDate,
+        reminderTimeMinutes = reminder.reminderTimeMinutes,
+        notes = TextEditingController(text: reminder.notes);
+
+  final String id;
+  final TextEditingController amount;
+  DateTime dueDate;
+  int reminderTimeMinutes;
+  final TextEditingController notes;
+
+  LoanRepaymentReminder toReminder({required String loanId, required String accountId, required DateTime now}) => LoanRepaymentReminder(
+        id: id,
+        loanId: loanId,
+        accountId: accountId,
+        amount: double.tryParse(amount.text) ?? 0,
+        dueDate: dueDate,
+        reminderTimeMinutes: reminderTimeMinutes,
+        notes: notes.text.trim(),
+        isPaid: false,
+        createdOn: now,
+        updatedOn: now,
+      );
+
+  void dispose() {
+    amount.dispose();
+    notes.dispose();
+  }
+}
+
+class _LoanReminderDraftTile extends StatelessWidget {
+  const _LoanReminderDraftTile({required this.draft, required this.index, required this.onChanged, required this.onRemove});
+  final _LoanReminderDraft draft;
+  final int index;
+  final VoidCallback onChanged;
+  final VoidCallback onRemove;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.45),
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Expanded(child: Text('Partial repayment ${index + 1}', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900))),
+              IconButton(onPressed: onRemove, icon: const Icon(Icons.close_rounded)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          TextField(controller: draft.amount, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Partial amount')),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(child: OutlinedButton.icon(onPressed: () async { final d = await pickDate(context, draft.dueDate); if (d != null) { draft.dueDate = d; onChanged(); } }, icon: const Icon(Icons.event_rounded), label: Text(DateFormat('MMM d, yyyy').format(draft.dueDate)))),
+            const SizedBox(width: 8),
+            Expanded(child: OutlinedButton.icon(onPressed: () async { final t = await pickTime(context, TimeOfDay(hour: draft.reminderTimeMinutes ~/ 60, minute: draft.reminderTimeMinutes % 60)); if (t != null) { draft.reminderTimeMinutes = t.hour * 60 + t.minute; onChanged(); } }, icon: const Icon(Icons.notifications_active_rounded), label: Text(_formatMinutesAsTime(draft.reminderTimeMinutes)))),
+          ]),
+          const SizedBox(height: 8),
+          TextField(controller: draft.notes, minLines: 1, maxLines: 2, decoration: const InputDecoration(labelText: 'Reminder notes')),
+        ],
+      ),
+    );
+  }
+}
+
+String _formatMinutesAsTime(int minutes) {
+  final hour = (minutes ~/ 60).clamp(0, 23);
+  final minute = minutes % 60;
+  final suffix = hour >= 12 ? 'PM' : 'AM';
+  final displayHour = hour == 0 ? 12 : (hour > 12 ? hour - 12 : hour);
+  return '$displayHour:${minute.toString().padLeft(2, '0')} $suffix';
+}
+
 Future<void> showRepaymentEditor(BuildContext context, Loan loan) async {
-  await showModalBottomSheet(context: context, isScrollControlled: true, showDragHandle: true, builder: (_) => RepaymentEditor(loan: loan));
+  await showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 640,
+    child: RepaymentEditor(loan: loan),
+  );
 }
 
 class RepaymentEditor extends StatefulWidget {
@@ -6412,8 +11544,9 @@ class _RepaymentEditorState extends State<RepaymentEditor> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
+    final accountOptions = state.operatingAccounts.isEmpty ? state.accounts : state.operatingAccounts;
     return Padding(
-      padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
       child: SingleChildScrollView(
         child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
           Text(widget.loan.type == LoanType.given ? 'Repayment received' : 'Repayment paid', textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
@@ -6422,14 +11555,14 @@ class _RepaymentEditorState extends State<RepaymentEditor> {
           const SizedBox(height: 12),
           AppleSelectionField(
             label: widget.loan.type == LoanType.given ? 'Receive repayment into account' : 'Pay repayment from account',
-            option: state.accounts.where((a) => a.id == accountId).firstOrNull == null ? null : optionFromAccount(state.accounts.where((a) => a.id == accountId).first, state),
+            option: accountOptions.where((a) => a.id == accountId).firstOrNull == null ? null : optionFromAccount(accountOptions.where((a) => a.id == accountId).first, state),
             emptyText: 'Choose account',
             onTap: () async {
               final selected = await showAppleWheelSelectionSheet(
                 context,
                 title: widget.loan.type == LoanType.given ? 'Choose Receiving Account' : 'Choose Payment Account',
                 selectedId: accountId,
-                options: state.accounts.map((a) => optionFromAccount(a, state)).toList(),
+                options: accountOptions.map((a) => optionFromAccount(a, state)).toList(),
               );
               if (selected != null) setState(() => accountId = selected);
             },
@@ -6475,36 +11608,17 @@ class SettingsScreen extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         child: Column(
           children: [
-            const _SettingsSearchField(),
-            const SizedBox(height: 12),
             SettingsTile(icon: Icons.palette_rounded, title: 'Theme', subtitle: _themeLabel(state.themePreference), color: '#A6E3A1', onTap: () => showThemeDialog(context)),
             SettingsTile(icon: Icons.payments_rounded, title: 'Currency customization', subtitle: '${state.currencyCode} • ${state.currencyPosition == CurrencyPosition.prefix ? 'Prefix' : 'Suffix'}', color: '#78D8E8', onTap: () => showCurrencySheet(context)),
             SettingsTile(icon: Icons.notifications_active_rounded, title: 'Reminder notification', subtitle: state.reminderEnabled ? 'Daily at ${state.reminderTime.format(context)}' : 'Disabled', color: '#FBC879', onTap: () => showReminderSheet(context)),
+            SettingsTile(icon: Icons.lightbulb_rounded, title: 'Savings suggestion profile', subtitle: state.savingsSuggestionProfile.shortLabel, color: '#FFB5D0', onTap: () => showSavingsSuggestionProfileSheet(context)),
             SettingsTile(icon: Icons.cloud_sync_rounded, title: 'Online data sync', subtitle: state.cloudSyncStatusText, color: '#78D8E8', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const CloudSyncScreen()))),
             SettingsTile(icon: Icons.filter_alt_rounded, title: 'Default date filter', subtitle: _dateRangeLabel(state.dateRangeType), color: '#B4A5FF', onTap: () => showDateRangeSheet(context)),
             SettingsTile(icon: Icons.ios_share_rounded, title: 'Export', subtitle: 'CSV / PDF reports with current filters', color: '#FFB5D0', onTap: () => showExportSheet(context)),
-            SettingsTile(icon: Icons.tune_rounded, title: 'Advanced settings', subtitle: 'Defaults, reorder, compact summary, app lock, backup', color: '#9AD0F5', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AdvancedSettingsScreen()))),
+            SettingsTile(icon: Icons.tune_rounded, title: 'Advanced settings', subtitle: 'Defaults, reorder, app lock, backup', color: '#9AD0F5', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AdvancedSettingsScreen()))),
             SettingsTile(icon: Icons.info_rounded, title: 'About app', subtitle: 'Version, credits, licenses, and links', color: '#86E3CE', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AboutScreen()))),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _SettingsSearchField extends StatelessWidget {
-  const _SettingsSearchField();
-
-  @override
-  Widget build(BuildContext context) {
-    return TextField(
-      readOnly: true,
-      decoration: InputDecoration(
-        prefixIcon: const Icon(Icons.search_rounded),
-        hintText: 'Search settings...',
-        filled: true,
-        fillColor: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.52),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       ),
     );
   }
@@ -6565,14 +11679,12 @@ class CloudSyncScreen extends StatefulWidget {
 class _CloudSyncScreenState extends State<CloudSyncScreen> {
   late final TextEditingController _syncIdController;
   late final TextEditingController _pinController;
-  bool _enabled = false;
   bool _obscurePin = true;
 
   @override
   void initState() {
     super.initState();
     final state = context.read<AppController>();
-    _enabled = state.cloudSyncEnabled;
     _syncIdController = TextEditingController(text: state.cloudSyncId);
     _pinController = TextEditingController(text: state.cloudSyncPin);
   }
@@ -6587,24 +11699,358 @@ class _CloudSyncScreenState extends State<CloudSyncScreen> {
   Future<void> _saveSettings({bool showStatus = true}) async {
     final state = context.read<AppController>();
     await state.configureCloudSync(
-      enabled: _enabled,
+      enabled: true,
       apiBaseUrl: state.cloudSyncApiBaseUrl,
       syncId: _syncIdController.text,
       pin: _pinController.text,
     );
     if (!mounted || !showStatus) return;
-    showSnack(context, _enabled ? 'Online sync settings saved.' : 'Online sync disabled.');
+    showSnack(context, 'Online sync settings saved.');
   }
 
   Future<void> _syncNow() async {
-    // The main Sync button intentionally uses the same flow as
-    // "Download cloud data to this device" so both buttons restore
-    // the latest approved cloud snapshot onto this phone.
-    await _downloadNow();
+    // Sync uploads this device's local data to the configured cloud target.
+    await _uploadNow();
   }
 
   Future<void> _uploadNow() async {
     await _saveSettings(showStatus: false);
+    final state = context.read<AppController>();
+    await state.syncMainOnlineToCloud(force: true);
+    if (!mounted) return;
+    _syncIdController.text = state.cloudSyncId;
+    _pinController.text = state.cloudSyncPin;
+    await _showSyncResult('Local data uploaded to cloud.');
+  }
+
+  Future<void> _downloadNow() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Download Data?'),
+        content: const Text('This replaces the local SQLite data on this device with the data saved under this Sync ID.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Download')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await _saveSettings(showStatus: false);
+    final state = context.read<AppController>();
+    await state.syncMainOnlineFromCloud();
+    if (!mounted) return;
+    await _showSyncResult('Cloud data downloaded.');
+  }
+
+  Future<void> _showSyncResult(String successMessage) async {
+    final state = context.read<AppController>();
+    if (state.cloudSyncApprovalRequired) {
+      await _showActivationDialog();
+      return;
+    }
+    showSnack(context, state.cloudSyncError == null ? successMessage : state.cloudSyncError!);
+  }
+
+  Future<void> _showActivationDialog() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Message admin to activate your online sync.'),
+        content: const Text('Your Sync ID is waiting for admin approval. After the admin approves it, press Sync again.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+          FilledButton.icon(
+            onPressed: () async {
+              await launchUrl(Uri.parse(kSyncAdminTelegramUrl), mode: LaunchMode.externalApplication);
+            },
+            icon: const Icon(Icons.send_rounded),
+            label: const Text('Telegram'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openAdvancedSettings() async {
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SyncDatabaseMethodsScreen()),
+    );
+    if (!mounted) return;
+    final state = context.read<AppController>();
+    setState(() {
+      _syncIdController.text = state.cloudSyncId;
+      _pinController.text = state.cloudSyncPin;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppController>();
+    return PageScaffold(
+      title: 'Online data sync',
+      actions: [
+        Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(18),
+            onTap: _openAdvancedSettings,
+            child: Container(
+              width: 52,
+              height: 52,
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(.55),
+                borderRadius: BorderRadius.circular(18),
+                border: Border.all(color: Theme.of(context).colorScheme.outline.withOpacity(.14)),
+              ),
+              child: const Icon(Icons.more_vert_rounded, size: 30),
+            ),
+          ),
+        ),
+      ],
+      child: ResponsiveContent(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _syncIdController,
+              textInputAction: TextInputAction.next,
+              decoration: const InputDecoration(
+                labelText: 'Sync ID',
+                hintText: 'Example: siam-main-wallet',
+                prefixIcon: Icon(Icons.badge_rounded),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _pinController,
+              obscureText: _obscurePin,
+              decoration: InputDecoration(
+                labelText: 'Sync PIN',
+                hintText: 'Minimum 4 characters',
+                prefixIcon: const Icon(Icons.password_rounded),
+                suffixIcon: IconButton(
+                  onPressed: () => setState(() => _obscurePin = !_obscurePin),
+                  icon: Icon(_obscurePin ? Icons.visibility_rounded : Icons.visibility_off_rounded),
+                ),
+              ),
+            ),
+            if (state.cloudSyncError != null && state.cloudSyncError!.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(state.cloudSyncError!, style: TextStyle(color: Theme.of(context).colorScheme.error, fontWeight: FontWeight.w800)),
+            ],
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: state.cloudSyncBusy || state.syncDatabaseProvider == SyncDatabaseProvider.local ? null : _syncNow,
+              icon: state.cloudSyncBusy
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.cloud_sync_rounded),
+              label: const Text('Sync'),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              onPressed: state.cloudSyncBusy || state.syncDatabaseProvider == SyncDatabaseProvider.local ? null : _downloadNow,
+              icon: const Icon(Icons.cloud_download_rounded),
+              label: const Text('Download Data'),
+            ),
+            const SizedBox(height: 14),
+            Text(
+              'Important: Sync uploads this device’s local data. Download Data replaces this device’s local data with the latest cloud data. Automatic sync runs after local changes once a database method is configured. Conflict handling is last-upload-wins.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class SyncDatabaseMethodsScreen extends StatelessWidget {
+  const SyncDatabaseMethodsScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return PageScaffold(
+      title: 'Hidden Settings',
+      child: ResponsiveContent(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ExpressiveCard(
+              padding: const EdgeInsets.all(18),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(22),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const SyncDatabaseMethodListScreen()),
+                ),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: kSleekAccent.withOpacity(.15),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: const Icon(Icons.cloud_sync_rounded, color: kSleekAccent),
+                    ),
+                    const SizedBox(width: 14),
+                    Expanded(
+                      child: Text(
+                        'Select database method',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900),
+                      ),
+                    ),
+                    Icon(Icons.chevron_right_rounded, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class SyncDatabaseMethodListScreen extends StatelessWidget {
+  const SyncDatabaseMethodListScreen({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final state = context.watch<AppController>();
+    return PageScaffold(
+      title: 'Select database method',
+      child: ResponsiveContent(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            ...userSyncDatabaseProviders.map(
+              (provider) => _ProviderChoiceCard(
+                provider: provider,
+                selected: state.syncDatabaseProvider == provider,
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => SyncDatabaseProviderConfigScreen(provider: provider)),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class SyncDatabaseProviderConfigScreen extends StatefulWidget {
+  const SyncDatabaseProviderConfigScreen({super.key, required this.provider});
+
+  final SyncDatabaseProvider provider;
+
+  @override
+  State<SyncDatabaseProviderConfigScreen> createState() => _SyncDatabaseProviderConfigScreenState();
+}
+
+class _SyncDatabaseProviderConfigScreenState extends State<SyncDatabaseProviderConfigScreen> {
+  late final TextEditingController _apiBaseUrlController;
+  late final TextEditingController _mongoUrlController;
+  late final TextEditingController _mongoDatabaseController;
+  late final TextEditingController _mongoCollectionController;
+  late final TextEditingController _mongoSyncIdController;
+  late final TextEditingController _mongoSyncPinController;
+  late final TextEditingController _tursoDatabaseUrlController;
+  late final TextEditingController _tursoAuthTokenController;
+  bool _obscureMongoUrl = true;
+  bool _obscureTursoToken = true;
+  bool _testing = false;
+  String? _status;
+
+  SyncDatabaseProvider get _provider => widget.provider;
+
+  @override
+  void initState() {
+    super.initState();
+    final state = context.read<AppController>();
+    _apiBaseUrlController = TextEditingController(text: state.cloudSyncApiBaseUrl);
+    _mongoUrlController = TextEditingController(text: state.syncMongoDbUrl);
+    _mongoDatabaseController = TextEditingController(text: state.syncMongoDatabaseName);
+    _mongoCollectionController = TextEditingController(text: state.syncMongoCollectionName);
+    _mongoSyncIdController = TextEditingController(text: state.syncMongoSyncId);
+    _mongoSyncPinController = TextEditingController(text: state.syncMongoSyncPin);
+    _tursoDatabaseUrlController = TextEditingController(text: state.syncTursoDatabaseUrl);
+    _tursoAuthTokenController = TextEditingController(text: state.syncTursoAuthToken);
+  }
+
+  @override
+  void dispose() {
+    _apiBaseUrlController.dispose();
+    _mongoUrlController.dispose();
+    _mongoDatabaseController.dispose();
+    _mongoCollectionController.dispose();
+    _mongoSyncIdController.dispose();
+    _mongoSyncPinController.dispose();
+    _tursoDatabaseUrlController.dispose();
+    _tursoAuthTokenController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _testConnection() async {
+    final state = context.read<AppController>();
+    setState(() {
+      _testing = true;
+      _status = null;
+    });
+    try {
+      await state.testSyncDatabaseConnection(
+        provider: _provider,
+        apiBaseUrl: _apiBaseUrlController.text,
+        mongoDbUrl: _mongoUrlController.text,
+        mongoDatabaseName: MongoDbSyncService.defaultDatabaseName,
+        mongoCollectionName: MongoDbSyncService.defaultCollectionName,
+      );
+      if (!mounted) return;
+      setState(() => _status = _provider == SyncDatabaseProvider.local ? 'Local Database is ready.' : 'Connection test passed.');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _status = redactSyncSecrets(error.toString().replaceFirst('Bad state: ', '').replaceFirst('Exception: ', '')));
+    } finally {
+      if (mounted) setState(() => _testing = false);
+    }
+  }
+
+  Future<void> _saveProviderSettings({bool showStatus = true, bool closePage = false}) async {
+    final state = context.read<AppController>();
+    await state.configureSyncDatabase(
+      provider: _provider,
+      apiBaseUrl: _apiBaseUrlController.text,
+      mongoDbUrl: _mongoUrlController.text,
+      mongoDatabaseName: MongoDbSyncService.defaultDatabaseName,
+      mongoCollectionName: MongoDbSyncService.defaultCollectionName,
+      tursoDatabaseUrl: _tursoDatabaseUrlController.text,
+      tursoAuthToken: _tursoAuthTokenController.text,
+    );
+    if (!mounted) return;
+    if (showStatus) showSnack(context, '${syncDatabaseProviderLabel(_provider)} settings saved.');
+    if (closePage) Navigator.pop(context);
+  }
+
+  Future<void> _save() async {
+    await _saveProviderSettings(closePage: true);
+  }
+
+  Future<void> _syncNow() async {
+    // Sync uploads this device's local data to the selected database provider.
+    await _uploadNow();
+  }
+
+  Future<void> _uploadNow() async {
+    await _saveProviderSettings(showStatus: false);
     final state = context.read<AppController>();
     await state.syncToCloud(force: true);
     if (!mounted) return;
@@ -6615,8 +12061,10 @@ class _CloudSyncScreenState extends State<CloudSyncScreen> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('Download cloud data?'),
-        content: const Text('This replaces the local SQLite data on this device with the data saved under this Sync ID.'),
+        title: const Text('Download Data?'),
+        content: Text(_provider == SyncDatabaseProvider.mongoDb
+            ? 'This replaces this device’s local data with the latest snapshot from your MongoDB database.'
+            : 'This replaces this device’s local data with the latest cloud snapshot for the current Sync ID.'),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
           FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Download')),
@@ -6624,7 +12072,7 @@ class _CloudSyncScreenState extends State<CloudSyncScreen> {
       ),
     );
     if (confirmed != true) return;
-    await _saveSettings(showStatus: false);
+    await _saveProviderSettings(showStatus: false);
     final state = context.read<AppController>();
     await state.syncFromCloud();
     if (!mounted) return;
@@ -6664,8 +12112,10 @@ class _CloudSyncScreenState extends State<CloudSyncScreen> {
   @override
   Widget build(BuildContext context) {
     final state = context.watch<AppController>();
+    final providerLabel = syncDatabaseProviderLabel(_provider);
     return PageScaffold(
-      title: 'Online data sync',
+      title: providerLabel,
+      subtitle: 'Sync method setup',
       child: ResponsiveContent(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 32),
         child: Column(
@@ -6676,85 +12126,484 @@ class _CloudSyncScreenState extends State<CloudSyncScreen> {
               child: Row(
                 children: [
                   Container(
-                    width: 46,
-                    height: 46,
+                    width: 48,
+                    height: 48,
                     decoration: BoxDecoration(
                       color: kSleekAccent.withOpacity(.15),
                       borderRadius: BorderRadius.circular(16),
                     ),
-                    child: const Icon(Icons.cloud_done_rounded, color: kSleekAccent),
+                    child: Icon(syncDatabaseProviderIcon(_provider), color: kSleekAccent),
                   ),
-                  const SizedBox(width: 12),
+                  const SizedBox(width: 14),
                   Expanded(
-                    child: Text(
-                      state.cloudSyncStatusText,
-                      style: const TextStyle(fontWeight: FontWeight.w900),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(providerLabel, style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+                        const SizedBox(height: 4),
+                        Text(syncDatabaseProviderSubtitle(_provider), style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                      ],
                     ),
                   ),
                 ],
               ),
             ),
             const SizedBox(height: 14),
-            SwitchListTile(
-              value: _enabled,
-              onChanged: state.cloudSyncBusy ? null : (value) => setState(() => _enabled = value),
-              title: const Text('Enable automatic sync'),
-              subtitle: const Text('After local changes, Koinly uploads the latest data automatically.'),
+            _providerFields(),
+            if (_status != null && _status!.trim().isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(_status!, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekAccent, fontWeight: FontWeight.w800)),
+            ],
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _testing || state.cloudSyncBusy ? null : _testConnection,
+                    icon: _testing ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.network_check_rounded),
+                    label: const Text('Test'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _testing || state.cloudSyncBusy ? null : _save,
+                    icon: const Icon(Icons.save_rounded),
+                    label: const Text('Save'),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: _syncIdController,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(
-                labelText: 'Sync ID',
-                hintText: 'Example: siam-main-wallet',
-                prefixIcon: Icon(Icons.badge_rounded),
-              ),
+            const SizedBox(height: 14),
+            _ProviderSyncActions(
+              provider: _provider,
+              busy: state.cloudSyncBusy,
+              onSync: _syncNow,
+              onUpload: _downloadNow,
             ),
-            const SizedBox(height: 10),
+          ],
+        ),
+      ),
+    );
+  }
+
+
+  Widget _workerBackedProviderFields(SyncDatabaseProvider provider) {
+    final label = syncDatabaseProviderLabel(provider);
+    return Column(
+      key: ValueKey('${enumName(provider)}-method-page'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: _apiBaseUrlController,
+          decoration: InputDecoration(
+            labelText: '$label API URL',
+            hintText: 'https://your-koinly-sync-worker.workers.dev',
+            prefixIcon: Icon(syncDatabaseProviderIcon(provider)),
+          ),
+        ),
+        const SizedBox(height: 10),
+        ExpressiveCard(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            '$label uses your Koinly sync backend API. Configure that backend to store snapshots in $label, then paste the API URL here. Sync ID and Sync PIN stay on this database method page.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _hiddenTursoNotice() {
+    return ExpressiveCard(
+      key: const ValueKey('turso-hidden'),
+      padding: const EdgeInsets.all(16),
+      child: const Text('Turso Database is hidden for users for now. Choose another database method.'),
+    );
+  }
+
+
+  Widget _providerFields() {
+    switch (_provider) {
+      case SyncDatabaseProvider.local:
+        return ExpressiveCard(
+          key: const ValueKey('local-method-page'),
+          padding: const EdgeInsets.all(16),
+          child: const Text('Local Database mode keeps everything in this device SQLite database. Online sync stays disabled and no credentials are required.'),
+        );
+      case SyncDatabaseProvider.mongoDb:
+        return Column(
+          key: const ValueKey('mongodb-method-page'),
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
             TextField(
-              controller: _pinController,
-              obscureText: _obscurePin,
+              controller: _mongoUrlController,
+              obscureText: _obscureMongoUrl,
               decoration: InputDecoration(
-                labelText: 'Sync PIN',
-                hintText: 'Minimum 4 characters',
-                prefixIcon: const Icon(Icons.password_rounded),
+                labelText: 'MongoDB URL',
+                hintText: 'mongodb+srv://user:password@cluster.mongodb.net/koinly',
+                prefixIcon: const Icon(Icons.link_rounded),
                 suffixIcon: IconButton(
-                  onPressed: () => setState(() => _obscurePin = !_obscurePin),
-                  icon: Icon(_obscurePin ? Icons.visibility_rounded : Icons.visibility_off_rounded),
+                  onPressed: () => setState(() => _obscureMongoUrl = !_obscureMongoUrl),
+                  icon: Icon(_obscureMongoUrl ? Icons.visibility_rounded : Icons.visibility_off_rounded),
                 ),
               ),
             ),
-            if (state.cloudSyncError != null && state.cloudSyncError!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Text(state.cloudSyncError!, style: TextStyle(color: Theme.of(context).colorScheme.error, fontWeight: FontWeight.w800)),
-            ],
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: state.cloudSyncBusy ? null : _syncNow,
-              icon: state.cloudSyncBusy
-                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                  : const Icon(Icons.cloud_sync_rounded),
-              label: const Text('Sync'),
-            ),
-            const SizedBox(height: 10),
-            OutlinedButton.icon(
-              onPressed: state.cloudSyncBusy ? null : _uploadNow,
-              icon: const Icon(Icons.cloud_upload_rounded),
-              label: const Text('Upload local data now'),
-            ),
-            const SizedBox(height: 10),
-            OutlinedButton.icon(
-              onPressed: state.cloudSyncBusy ? null : _downloadNow,
-              icon: const Icon(Icons.cloud_download_rounded),
-              label: const Text('Download cloud data to this device'),
-            ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 8),
             Text(
-              'Important: Download replaces this device’s local data. Create a local backup before downloading if you are not sure. Conflict handling is last-upload-wins.',
+              'Use your own MongoDB database. Koinly stores one latest app snapshot in its internal collection.',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
             ),
           ],
+        );
+      case SyncDatabaseProvider.turso:
+        return _hiddenTursoNotice();
+      case SyncDatabaseProvider.cloudflareD1:
+      case SyncDatabaseProvider.supabase:
+      case SyncDatabaseProvider.neonPostgres:
+      case SyncDatabaseProvider.firebaseFirestore:
+        return _workerBackedProviderFields(_provider);
+    }
+  }
+}
+
+class _ProviderSyncActions extends StatelessWidget {
+  const _ProviderSyncActions({
+    required this.provider,
+    required this.busy,
+    required this.onSync,
+    required this.onUpload,
+  });
+
+  final SyncDatabaseProvider provider;
+  final bool busy;
+  final VoidCallback onSync;
+  final VoidCallback onUpload;
+
+  @override
+  Widget build(BuildContext context) {
+    final isCloudProvider = provider != SyncDatabaseProvider.local && provider != SyncDatabaseProvider.turso;
+    final disabled = busy || !isCloudProvider;
+    return ExpressiveCard(
+      padding: const EdgeInsets.all(14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 42,
+                height: 42,
+                decoration: BoxDecoration(
+                  color: kSleekAccent.withOpacity(.15),
+                  borderRadius: BorderRadius.circular(15),
+                ),
+                child: const Icon(Icons.sync_rounded, color: kSleekAccent),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Sync actions', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          FilledButton.icon(
+            onPressed: disabled ? null : onSync,
+            icon: busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.sync_rounded),
+            label: const Text('Sync'),
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: disabled ? null : onUpload,
+            icon: const Icon(Icons.cloud_download_rounded),
+            label: const Text('Download Data'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SyncAdvancedDatabasePopup extends StatefulWidget {
+  const SyncAdvancedDatabasePopup({super.key});
+
+  @override
+  State<SyncAdvancedDatabasePopup> createState() => _SyncAdvancedDatabasePopupState();
+}
+
+class _SyncAdvancedDatabasePopupState extends State<SyncAdvancedDatabasePopup> {
+  late SyncDatabaseProvider _provider;
+  late final TextEditingController _apiBaseUrlController;
+  late final TextEditingController _mongoUrlController;
+  late final TextEditingController _mongoDatabaseController;
+  late final TextEditingController _mongoCollectionController;
+  late final TextEditingController _tursoDatabaseUrlController;
+  late final TextEditingController _tursoAuthTokenController;
+  bool _obscureMongoUrl = true;
+  bool _obscureTursoToken = true;
+  bool _testing = false;
+  String? _status;
+
+  @override
+  void initState() {
+    super.initState();
+    final state = context.read<AppController>();
+    _provider = state.syncDatabaseProvider == SyncDatabaseProvider.turso ? SyncDatabaseProvider.local : state.syncDatabaseProvider;
+    _apiBaseUrlController = TextEditingController(text: state.cloudSyncApiBaseUrl);
+    _mongoUrlController = TextEditingController(text: state.syncMongoDbUrl);
+    _mongoDatabaseController = TextEditingController(text: state.syncMongoDatabaseName);
+    _mongoCollectionController = TextEditingController(text: state.syncMongoCollectionName);
+    _tursoDatabaseUrlController = TextEditingController(text: state.syncTursoDatabaseUrl);
+    _tursoAuthTokenController = TextEditingController(text: state.syncTursoAuthToken);
+  }
+
+  @override
+  void dispose() {
+    _apiBaseUrlController.dispose();
+    _mongoUrlController.dispose();
+    _mongoDatabaseController.dispose();
+    _mongoCollectionController.dispose();
+    _tursoDatabaseUrlController.dispose();
+    _tursoAuthTokenController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _testConnection() async {
+    final state = context.read<AppController>();
+    setState(() {
+      _testing = true;
+      _status = null;
+    });
+    try {
+      await state.testSyncDatabaseConnection(
+        provider: _provider,
+        apiBaseUrl: _apiBaseUrlController.text,
+        mongoDbUrl: _mongoUrlController.text,
+        mongoDatabaseName: MongoDbSyncService.defaultDatabaseName,
+        mongoCollectionName: MongoDbSyncService.defaultCollectionName,
+      );
+      if (!mounted) return;
+      setState(() => _status = _provider == SyncDatabaseProvider.local ? 'Local Database is ready.' : 'Connection test passed.');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _status = redactSyncSecrets(error.toString().replaceFirst('Bad state: ', '').replaceFirst('Exception: ', '')));
+    } finally {
+      if (mounted) setState(() => _testing = false);
+    }
+  }
+
+  Future<void> _save() async {
+    final state = context.read<AppController>();
+    await state.configureSyncDatabase(
+      provider: _provider,
+      apiBaseUrl: _apiBaseUrlController.text,
+      mongoDbUrl: _mongoUrlController.text,
+      mongoDatabaseName: MongoDbSyncService.defaultDatabaseName,
+      mongoCollectionName: MongoDbSyncService.defaultCollectionName,
+      tursoDatabaseUrl: _tursoDatabaseUrlController.text,
+      tursoAuthToken: _tursoAuthTokenController.text,
+    );
+    if (!mounted) return;
+    showSnack(context, 'Advanced sync database settings saved.');
+    Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(color: kSleekAccent.withOpacity(.14), borderRadius: BorderRadius.circular(16)),
+                  child: const Icon(Icons.tune_rounded, color: kSleekAccent),
+                ),
+                const SizedBox(width: 12),
+                Expanded(child: Text('Advanced sync database', style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900))),
+                IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.close_rounded)),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Text(
+              'Choose where Koinly stores online sync snapshots. Credentials are saved with platform secure storage and are not included in backups.',
+              style: theme.textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 16),
+            ...userSyncDatabaseProviders.map((provider) => _ProviderChoiceCard(
+                  provider: provider,
+                  selected: _provider == provider,
+                  onTap: () => setState(() => _provider = provider),
+                )),
+            const SizedBox(height: 10),
+            AnimatedSwitcher(
+              duration: AppMotion.medium,
+              switchInCurve: AppMotion.emphasized,
+              switchOutCurve: AppMotion.emphasizedAccelerate,
+              child: _providerFields(),
+            ),
+            if (_status != null && _status!.trim().isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text(_status!, style: theme.textTheme.bodySmall?.copyWith(color: kSleekAccent, fontWeight: FontWeight.w800)),
+            ],
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _testing ? null : _testConnection,
+                    icon: _testing ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.network_check_rounded),
+                    label: const Text('Test Connection'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _testing ? null : _save,
+                    icon: const Icon(Icons.save_rounded),
+                    label: const Text('Save'),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+
+  Widget _workerBackedProviderFields(SyncDatabaseProvider provider) {
+    final label = syncDatabaseProviderLabel(provider);
+    return Column(
+      key: ValueKey('${enumName(provider)}-advanced'),
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: _apiBaseUrlController,
+          decoration: InputDecoration(
+            labelText: '$label API URL',
+            hintText: 'https://your-koinly-sync-worker.workers.dev',
+            prefixIcon: Icon(syncDatabaseProviderIcon(provider)),
+          ),
+        ),
+        const SizedBox(height: 10),
+        ExpressiveCard(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            '$label uses your Koinly sync backend API. Configure that backend to store snapshots in $label, then paste the API URL here. Sync ID and Sync PIN stay on this database method page.',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _hiddenTursoNotice() {
+    return ExpressiveCard(
+      key: const ValueKey('turso-hidden-advanced'),
+      padding: const EdgeInsets.all(16),
+      child: const Text('Turso Database is hidden for users for now. Choose another database method.'),
+    );
+  }
+
+  Widget _providerFields() {
+    switch (_provider) {
+      case SyncDatabaseProvider.local:
+        return ExpressiveCard(
+          key: const ValueKey('local'),
+          padding: const EdgeInsets.all(16),
+          child: const Text('Local Database mode keeps everything in this device SQLite database. Online sync stays disabled and no credentials are required.'),
+        );
+      case SyncDatabaseProvider.mongoDb:
+        return Column(
+          key: const ValueKey('mongodb'),
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _mongoUrlController,
+              obscureText: _obscureMongoUrl,
+              decoration: InputDecoration(
+                labelText: 'MongoDB URL',
+                hintText: 'mongodb+srv://user:password@cluster.mongodb.net/koinly',
+                prefixIcon: const Icon(Icons.link_rounded),
+                suffixIcon: IconButton(
+                  onPressed: () => setState(() => _obscureMongoUrl = !_obscureMongoUrl),
+                  icon: Icon(_obscureMongoUrl ? Icons.visibility_rounded : Icons.visibility_off_rounded),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Use your own MongoDB database. Koinly stores one latest app snapshot in its internal collection.',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+            ),
+          ],
+        );
+      case SyncDatabaseProvider.turso:
+        return _hiddenTursoNotice();
+      case SyncDatabaseProvider.cloudflareD1:
+      case SyncDatabaseProvider.supabase:
+      case SyncDatabaseProvider.neonPostgres:
+      case SyncDatabaseProvider.firebaseFirestore:
+        return _workerBackedProviderFields(_provider);
+    }
+  }
+}
+
+class _ProviderChoiceCard extends StatelessWidget {
+  const _ProviderChoiceCard({required this.provider, required this.selected, required this.onTap});
+
+  final SyncDatabaseProvider provider;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(22),
+        onTap: onTap,
+        child: AnimatedContainer(
+          duration: AppMotion.fast,
+          curve: AppMotion.emphasized,
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: selected ? kSleekAccent.withOpacity(.16) : scheme.surfaceContainerHighest.withOpacity(.34),
+            borderRadius: BorderRadius.circular(selected ? 28 : 22),
+            border: Border.all(color: selected ? kSleekAccent.withOpacity(.75) : scheme.outline.withOpacity(.18), width: selected ? 1.5 : 1),
+          ),
+          child: Row(
+            children: [
+              Icon(syncDatabaseProviderIcon(provider), color: selected ? kSleekAccent : scheme.onSurfaceVariant),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(syncDatabaseProviderLabel(provider), style: const TextStyle(fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 3),
+                    Text(syncDatabaseProviderSubtitle(provider), style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                  ],
+                ),
+              ),
+              Icon(selected ? Icons.check_circle_rounded : Icons.radio_button_unchecked_rounded, color: selected ? kSleekAccent : scheme.onSurfaceVariant),
+            ],
+          ),
         ),
       ),
     );
@@ -6767,18 +12616,57 @@ extension _BubbleOverride on Widget {
       });
 }
 
-void showThemeDialog(BuildContext context) {
+Future<void> showThemeDialog(BuildContext context) async {
   final state = context.read<AppController>();
-  showDialog(
-    context: context,
-    builder: (_) => AlertDialog(
-      title: const Text('Theme'),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: ThemePreference.values.map((t) => RadioListTile<ThemePreference>(title: Text(_themeLabel(t)), value: t, groupValue: state.themePreference, onChanged: (v) async { if (v != null) { await state.saveTheme(v); if (context.mounted) Navigator.pop(context); } })).toList(),
-      ),
-    ),
+  final selectedId = await showAppleWheelSelectionSheet(
+    context,
+    title: 'Choose Theme',
+    selectedId: enumName(state.themePreference),
+    options: ThemePreference.values.map(optionFromThemePreference).toList(),
   );
+  if (selectedId == null) return;
+  final selected = ThemePreference.values.firstWhere(
+    (theme) => enumName(theme) == selectedId,
+    orElse: () => state.themePreference,
+  );
+  await state.saveTheme(selected);
+}
+
+SelectionOption optionFromThemePreference(ThemePreference theme) {
+  switch (theme) {
+    case ThemePreference.system:
+      return const SelectionOption(
+        id: 'system',
+        title: 'System Default',
+        subtitle: 'Follow device setting',
+        iconName: 'theme_system',
+        iconColor: '#A6E3A1',
+      );
+    case ThemePreference.light:
+      return const SelectionOption(
+        id: 'light',
+        title: 'Light',
+        subtitle: 'Bright interface',
+        iconName: 'theme_light',
+        iconColor: '#FBC879',
+      );
+    case ThemePreference.dark:
+      return const SelectionOption(
+        id: 'dark',
+        title: 'Dark',
+        subtitle: 'Low-light interface',
+        iconName: 'theme_dark',
+        iconColor: '#B4A5FF',
+      );
+    case ThemePreference.batterySaver:
+      return const SelectionOption(
+        id: 'batterySaver',
+        title: 'Battery Saver / System',
+        subtitle: 'Use system behavior',
+        iconName: 'theme_battery',
+        iconColor: '#78D8E8',
+      );
+  }
 }
 
 String _themeLabel(ThemePreference t) {
@@ -6803,12 +12691,17 @@ String _dateRangeLabel(DateRangeType type) {
 
 void showCurrencySheet(BuildContext context) {
   final state = context.read<AppController>();
-  showModalBottomSheet(context: context, isScrollControlled: true, showDragHandle: true, builder: (_) => Padding(
-        padding: EdgeInsets.only(left: 18, right: 18, bottom: MediaQuery.of(context).viewInsets.bottom + 18),
-        child: SingleChildScrollView(
-          child: CurrencyForm(initialSymbol: state.currencySymbol, initialCode: state.currencyCode, initialPosition: state.currencyPosition, initialSeparators: state.useSeparators, closeAfterSave: true),
-        ),
-      ));
+  showKoinlyPopup<void>(
+    context,
+    maxWidth: 560,
+    maxHeight: 720,
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 14),
+      child: SingleChildScrollView(
+        child: CurrencyForm(initialSymbol: state.currencySymbol, initialCode: state.currencyCode, initialPosition: state.currencyPosition, initialSeparators: state.useSeparators, closeAfterSave: true),
+      ),
+    ),
+  );
 }
 
 class CurrencyForm extends StatefulWidget {
@@ -7175,153 +13068,144 @@ Future<List<String>?> showCurrencyWheelPickerSheet(
     return filtered;
   }
 
-  return showModalBottomSheet<List<String>>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    builder: (sheetContext) {
-      return StatefulBuilder(
-        builder: (context, setModalState) {
-          final filtered = filteredCountries();
-          if (filtered.isNotEmpty && selectedIndex >= filtered.length) selectedIndex = 0;
-          final safeIndex = filtered.isEmpty ? 0 : (selectedIndex < 0 ? 0 : selectedIndex >= filtered.length ? filtered.length - 1 : selectedIndex);
-          final selected = filtered.isEmpty ? null : filtered[safeIndex];
-          final dark = Theme.of(context).brightness == Brightness.dark;
-          final sheetColor = dark ? const Color(0xFF10191D) : Colors.white;
-          final innerColor = dark ? const Color(0xFF0B1417) : const Color(0xFFF5FAFB);
-          final borderColor = dark ? const Color(0xFF24343A) : const Color(0xFFDCE8EB);
-          final innerBorderColor = dark ? const Color(0xFF1F3036) : const Color(0xFFDCE8EB);
-          final handleColor = dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE);
+  return showKoinlyPopup<List<String>>(
+    context,
+    maxWidth: 560,
+    maxHeight: 660,
+    child: StatefulBuilder(
+      builder: (dialogContext, setModalState) {
+        final filtered = filteredCountries();
+        if (filtered.isNotEmpty && selectedIndex >= filtered.length) selectedIndex = 0;
+        final safeIndex = filtered.isEmpty ? 0 : (selectedIndex < 0 ? 0 : selectedIndex >= filtered.length ? filtered.length - 1 : selectedIndex);
+        final selected = filtered.isEmpty ? null : filtered[safeIndex];
+        final dark = Theme.of(dialogContext).brightness == Brightness.dark;
+        final innerColor = dark ? const Color(0xFF0B1417) : const Color(0xFFF5FAFB);
+        final innerBorderColor = dark ? const Color(0xFF1F3036) : const Color(0xFFDCE8EB);
+        final handleColor = dark ? const Color(0xFF43545B) : const Color(0xFFB7C8CE);
 
-          return SafeArea(
-            top: false,
-            child: Container(
-              margin: const EdgeInsets.all(12),
-              padding: EdgeInsets.fromLTRB(16, 10, 16, MediaQuery.of(context).viewInsets.bottom + 16),
-              decoration: BoxDecoration(
-                color: sheetColor,
-                borderRadius: BorderRadius.circular(28),
-                border: Border.all(color: borderColor),
-                boxShadow: [BoxShadow(color: Colors.black.withOpacity(.45), blurRadius: 28, offset: const Offset(0, -8))],
+        return SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 44,
+                height: 5,
+                decoration: BoxDecoration(color: handleColor, borderRadius: BorderRadius.circular(999)),
               ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 44,
-                    height: 5,
-                    decoration: BoxDecoration(color: handleColor, borderRadius: BorderRadius.circular(999)),
-                  ),
-                  const SizedBox(height: 18),
-                  Text('Choose currency', textAlign: TextAlign.center, style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
-                  const SizedBox(height: 12),
-                  TextField(
-                    autofocus: false,
-                    decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.search_rounded),
-                      hintText: 'Search countries or currency code',
-                    ),
-                    onChanged: (value) => setModalState(() {
-                      search = value;
-                      selectedIndex = 0;
-                    }),
-                  ),
-                  const SizedBox(height: 12),
-                  Container(
-                    height: 252,
-                    decoration: BoxDecoration(
-                      color: innerColor,
-                      borderRadius: BorderRadius.circular(22),
-                      border: Border.all(color: innerBorderColor),
-                    ),
-                    child: filtered.isEmpty
-                        ? Center(
-                            child: Text(
-                              'No currency found',
-                              style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
-                            ),
-                          )
-                        : Stack(
-                            alignment: Alignment.center,
-                            children: [
-                              IgnorePointer(
-                                child: Container(
-                                  height: 72,
-                                  margin: const EdgeInsets.symmetric(horizontal: 12),
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(18),
-                                    color: kSleekAccent.withOpacity(.10),
-                                    border: Border.all(color: kSleekAccent.withOpacity(.28), width: 1.1),
-                                  ),
-                                ),
-                              ),
-                              ListWheelScrollView.useDelegate(
-                                key: ValueKey(search),
-                                itemExtent: 72,
-                                diameterRatio: 100000,
-                                perspective: 0.0001,
-                                squeeze: 1.0,
-                                physics: const FixedExtentScrollPhysics(),
-                                overAndUnderCenterOpacity: .34,
-                                onSelectedItemChanged: (index) => setModalState(() => selectedIndex = index),
-                                childDelegate: ListWheelChildBuilderDelegate(
-                                  childCount: filtered.length,
-                                  builder: (context, index) {
-                                    final c = filtered[index];
-                                    final isSelected = index == safeIndex;
-                                    return _CurrencyWheelRow(country: c, selected: isSelected);
-                                  },
-                                ),
-                              ),
-                            ],
-                          ),
-                  ),
-                  const SizedBox(height: 12),
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 180),
-                    child: selected == null
-                        ? const SizedBox(height: 40)
-                        : Row(
-                            key: ValueKey('${selected[0]}-${selected[2]}'),
-                            children: [
-                              _CurrencySymbolBubble(symbol: selected[1], selected: true),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  selected[0],
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
-                                ),
-                              ),
-                              Text(
-                                '${selected[1]} • ${selected[2]}',
-                                style: Theme.of(context).textTheme.labelMedium?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w800),
-                              ),
-                            ],
-                          ),
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      Expanded(child: OutlinedButton(onPressed: () => Navigator.pop(sheetContext), child: const Text('Cancel'))),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        flex: 2,
-                        child: FilledButton(
-                          onPressed: selected == null ? null : () => Navigator.pop(sheetContext, selected),
-                          child: const Text('Done'),
+              const SizedBox(height: 18),
+              Text('Choose currency', textAlign: TextAlign.center, style: Theme.of(dialogContext).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900)),
+              const SizedBox(height: 12),
+              TextField(
+                autofocus: false,
+                decoration: const InputDecoration(
+                  prefixIcon: Icon(Icons.search_rounded),
+                  hintText: 'Search countries or currency code',
+                ),
+                onChanged: (value) => setModalState(() {
+                  search = value;
+                  selectedIndex = 0;
+                }),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                height: 252,
+                decoration: BoxDecoration(
+                  color: innerColor,
+                  borderRadius: BorderRadius.circular(22),
+                  border: Border.all(color: innerBorderColor),
+                ),
+                child: filtered.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No currency found',
+                          style: Theme.of(dialogContext).textTheme.bodyLarge?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
                         ),
+                      )
+                    : Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          IgnorePointer(
+                            child: Container(
+                              height: 72,
+                              margin: const EdgeInsets.symmetric(horizontal: 12),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(18),
+                                color: kSleekAccent.withOpacity(.10),
+                                border: Border.all(color: kSleekAccent.withOpacity(.28), width: 1.1),
+                              ),
+                            ),
+                          ),
+                          ListWheelScrollView.useDelegate(
+                            key: ValueKey(search),
+                            itemExtent: 72,
+                            diameterRatio: 100000,
+                            perspective: 0.0001,
+                            squeeze: 1.0,
+                            physics: const FixedExtentScrollPhysics(),
+                            overAndUnderCenterOpacity: .34,
+                            onSelectedItemChanged: (index) => setModalState(() => selectedIndex = index),
+                            childDelegate: ListWheelChildBuilderDelegate(
+                              childCount: filtered.length,
+                              builder: (context, index) {
+                                final c = filtered[index];
+                                final isSelected = index == safeIndex;
+                                return _CurrencyWheelRow(country: c, selected: isSelected);
+                              },
+                            ),
+                          ),
+                        ],
                       ),
-                    ],
+              ),
+              const SizedBox(height: 12),
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 180),
+                child: selected == null
+                    ? const SizedBox(height: 40)
+                    : Row(
+                        key: ValueKey('${selected[0]}-${selected[2]}'),
+                        children: [
+                          _CurrencySymbolBubble(symbol: selected[1], selected: true),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              selected[0],
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(dialogContext).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w900),
+                            ),
+                          ),
+                          Text(
+                            '${selected[1]} • ${selected[2]}',
+                            style: Theme.of(dialogContext).textTheme.labelMedium?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w800),
+                          ),
+                        ],
+                      ),
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton(
+                      onPressed: () => Navigator.pop(dialogContext),
+                      child: const Text('Cancel'),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: FilledButton(
+                      onPressed: selected == null ? null : () => Navigator.pop(dialogContext, selected),
+                      child: const Text('Done'),
+                    ),
                   ),
                 ],
               ),
-            ),
-          );
-        },
-      );
-    },
+            ],
+          ),
+        );
+      },
+    ),
   );
 }
 
@@ -7412,7 +13296,7 @@ class _CurrencySymbolBubble extends StatelessWidget {
 
 
 void showReminderSheet(BuildContext context) {
-  showModalBottomSheet(context: context, showDragHandle: true, builder: (_) => const ReminderSheet());
+  showKoinlyPopup<void>(context, maxWidth: 520, maxHeight: 520, child: const ReminderSheet());
 }
 
 class ReminderSheet extends StatefulWidget {
@@ -7438,7 +13322,7 @@ class _ReminderSheetState extends State<ReminderSheet> {
   Widget build(BuildContext context) {
     final state = context.read<AppController>();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
+      padding: const EdgeInsets.fromLTRB(18, 22, 18, 24),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Text('Daily reminder', textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
         SwitchListTile(value: enabled, onChanged: (v) => setState(() => enabled = v), title: const Text('Enable reminder'), subtitle: const Text('Notification text: “Don’t forget to record your expenses”')),
@@ -7451,7 +13335,7 @@ class _ReminderSheetState extends State<ReminderSheet> {
 }
 
 void showExportSheet(BuildContext context) {
-  showModalBottomSheet(context: context, showDragHandle: true, builder: (_) => const ExportSheet());
+  showKoinlyPopup<void>(context, maxWidth: 520, maxHeight: 520, child: const ExportSheet());
 }
 
 class ExportSheet extends StatelessWidget {
@@ -7462,7 +13346,7 @@ class ExportSheet extends StatelessWidget {
     final state = context.watch<AppController>();
     final txs = state.filteredTransactions();
     return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
+      padding: const EdgeInsets.fromLTRB(18, 22, 18, 24),
       child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         Text('Export report', textAlign: TextAlign.center, style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
         const SizedBox(height: 8),
@@ -7491,8 +13375,41 @@ class AdvancedSettingsScreen extends StatelessWidget {
           SettingsTile(icon: Icons.north_east_rounded, title: 'Default expense category', subtitle: state.defaultExpenseCategoryId == null ? 'Not selected' : state.categoryOf(state.defaultExpenseCategoryId!)?.name ?? 'Unknown', color: '#FF9F9F', onTap: () => showDefaultSelection(context, 'expense')),
           SettingsTile(icon: Icons.south_west_rounded, title: 'Default income category', subtitle: state.defaultIncomeCategoryId == null ? 'Not selected' : state.categoryOf(state.defaultIncomeCategoryId!)?.name ?? 'Unknown', color: '#A6E3A1', onTap: () => showDefaultSelection(context, 'income')),
           SettingsTile(icon: Icons.swap_vert_rounded, title: 'Account reorder', subtitle: 'Reorder account sequence', color: '#FBC879', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AccountReorderScreen()))),
-          SwitchListTile(value: state.compactHomeSummary, onChanged: state.setCompactHome, title: const Text('Compact home summary'), subtitle: const Text('Use a shorter dashboard summary card.')),
-          SwitchListTile(value: state.appLockEnabled, onChanged: state.setAppLock, title: const Text('App lock'), subtitle: const Text('Uses fingerprint or device PIN/password when available.')),
+          Padding(
+            padding: const EdgeInsets.only(bottom: 10),
+            child: ExpressiveCard(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                children: [
+                  Container(
+                    width: 48,
+                    height: 48,
+                    decoration: BoxDecoration(
+                      color: colorFromHex('#9AD0F5').withOpacity(.16),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: colorFromHex('#9AD0F5').withOpacity(.20)),
+                    ),
+                    child: Icon(Icons.lock_rounded, color: colorFromHex('#9AD0F5')),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('App lock', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w900)),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Uses fingerprint or device PIN/password when available.',
+                          style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Switch(value: state.appLockEnabled, onChanged: state.setAppLock),
+                ],
+              ),
+            ),
+          ),
           SettingsTile(icon: Icons.backup_rounded, title: 'Backup', color: '#86E3CE', onTap: () => runBackupFlow(context, state)),
           SettingsTile(icon: Icons.restore_rounded, title: 'Restore', color: '#B4A5FF', onTap: () => runRestoreFlow(context, state)),
         ]),
@@ -7501,36 +13418,61 @@ class AdvancedSettingsScreen extends StatelessWidget {
   }
 }
 
-void showDefaultSelection(BuildContext context, String mode) {
+Future<void> showDefaultSelection(BuildContext context, String mode) async {
   final state = context.read<AppController>();
-  showModalBottomSheet(context: context, showDragHandle: true, builder: (_) {
-    final items = mode == 'account' ? state.accounts : state.categories.where((c) => c.type == (mode == 'income' ? CategoryType.income : CategoryType.expense) && !c.isLoanSystemCategory).toList();
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(18, 0, 18, 24),
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        Text('Choose default', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w900)),
-        ...items.map((item) {
-          if (item is Account) return ListTile(title: Text(item.name), onTap: () async { await state.saveDefaults(accountId: item.id); if (context.mounted) Navigator.pop(context); });
-          final c = item as Category;
-          return ListTile(title: Text(c.name), onTap: () async { await state.saveDefaults(incomeCategoryId: mode == 'income' ? c.id : null, expenseCategoryId: mode == 'expense' ? c.id : null); if (context.mounted) Navigator.pop(context); });
-        }),
-      ]),
+
+  if (mode == 'account') {
+    final selected = await showAppleWheelSelectionSheet(
+      context,
+      title: 'Choose Default Account',
+      selectedId: state.defaultAccountId,
+      options: state.accounts.map((account) => optionFromAccount(account, state)).toList(),
     );
-  });
+    if (selected != null) await state.saveDefaults(accountId: selected);
+    return;
+  }
+
+  final isIncome = mode == 'income';
+  final categories = state.categories
+      .where((category) => category.type == (isIncome ? CategoryType.income : CategoryType.expense) && !category.isLoanSystemCategory)
+      .toList();
+
+  final selected = await showAppleWheelSelectionSheet(
+    context,
+    title: isIncome ? 'Choose Default Income Category' : 'Choose Default Expense Category',
+    selectedId: isIncome ? state.defaultIncomeCategoryId : state.defaultExpenseCategoryId,
+    options: categories.map(optionFromCategory).toList(),
+  );
+
+  if (selected != null) {
+    await state.saveDefaults(
+      incomeCategoryId: isIncome ? selected : null,
+      expenseCategoryId: isIncome ? null : selected,
+    );
+  }
+}
+
+class _AboutLink {
+  const _AboutLink(this.label, this.shortLabel, this.icon, this.url);
+
+  final String label;
+  final String shortLabel;
+  final IconData icon;
+  final String url;
 }
 
 class AboutScreen extends StatelessWidget {
   const AboutScreen({super.key});
 
   static const links = [
-    ('Telegram', Icons.chat_rounded, 'https://t.me/Ch0wdhury_Siam'),
-    ('Telegram Alternative', Icons.forum_rounded, 'https://t.me/Chowdhury_Siam'),
-    ('GitHub', Icons.code_rounded, 'https://github.com/Chowdhury-Siam'),
-    ('MyAnimeList', Icons.movie_filter_rounded, 'https://myanimelist.net/profile/Siam_Chowdhury'),
-    ('AniList', Icons.auto_awesome_rounded, 'https://anilist.co/user/SiamChowdhury/'),
-    ('YouTube', Icons.play_circle_rounded, 'https://www.youtube.com/@SCS_Otaku'),
-    ('X / Twitter', Icons.alternate_email_rounded, 'https://x.com/SiamChowdhuryy'),
-    ('Email', Icons.mail_rounded, 'mailto:ssiam4235@gmail.com'),
+    _AboutLink('Telegram', 'Telegram', Icons.near_me_rounded, 'https://t.me/Ch0wdhury_Siam'),
+    _AboutLink('Telegram backup', 'Telegram 2', Icons.send_rounded, 'https://t.me/Chowdhury_Siam'),
+    _AboutLink('GitHub', 'GitHub', Icons.code_rounded, 'https://github.com/Chowdhury-Siam'),
+    _AboutLink('MyAnimeList', 'MAL', Icons.format_list_bulleted_rounded, 'https://myanimelist.net/profile/Siam_Chowdhury'),
+    _AboutLink('AniList', 'AniList', Icons.analytics_rounded, 'https://anilist.co/user/SiamChowdhury/'),
+    _AboutLink('YouTube', 'YouTube', Icons.play_circle_fill_rounded, 'https://www.youtube.com/@SCS_Otaku'),
+    _AboutLink('X / Twitter', 'X', Icons.close_rounded, 'https://x.com/SiamChowdhuryy'),
+    _AboutLink('Email', 'Email', Icons.email_rounded, 'mailto:ssiam4235@gmail.com'),
   ];
 
   @override
@@ -7548,15 +13490,20 @@ class AboutScreen extends StatelessWidget {
                 const SizedBox(height: 12),
                 Text('Developed by Siam Chowdhury', style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w900), textAlign: TextAlign.center),
                 const SizedBox(height: 8),
-                const Text('Version: 1.0.0', textAlign: TextAlign.center),
+                Text('Version: $appVersion', textAlign: TextAlign.center),
                 const SizedBox(height: 16),
-                Wrap(alignment: WrapAlignment.center, spacing: 8, runSpacing: 8, children: links.map((l) => IconButton.filledTonal(tooltip: l.$1, icon: Icon(l.$2), onPressed: () => launchUrl(Uri.parse(l.$3), mode: LaunchMode.externalApplication))).toList()),
+                Wrap(
+                  alignment: WrapAlignment.center,
+                  spacing: 10,
+                  runSpacing: 12,
+                  children: links.map((link) => _AboutLinkButton(link: link)).toList(),
+                ),
               ]),
             ),
             const SectionHeader('Legal'),
             SettingsTile(icon: Icons.privacy_tip_rounded, title: 'Privacy Policy', subtitle: 'Local data-first finance tracker', color: '#78D8E8', onTap: () => _showLegal(context, 'Privacy Policy')),
             SettingsTile(icon: Icons.description_rounded, title: 'Terms and conditions', subtitle: 'Usage terms', color: '#A6E3A1', onTap: () => _showLegal(context, 'Terms and conditions')),
-            SettingsTile(icon: Icons.balance_rounded, title: 'Open-source licenses', subtitle: 'Apache License 2.0 and Flutter package notices', color: '#FBC879', onTap: () => showLicensePage(context: context, applicationName: appTitle, applicationVersion: appVersion)),
+            SettingsTile(icon: Icons.balance_rounded, title: 'Open-source licenses', subtitle: 'Apache License 2.0 and Flutter package notices', color: '#FBC879', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const KoinlyLicenseScreen()))),
           ],
         ),
       ),
@@ -7565,5 +13512,330 @@ class AboutScreen extends StatelessWidget {
 
   void _showLegal(BuildContext context, String title) {
     showDialog(context: context, builder: (_) => AlertDialog(title: Text(title), content: const Text('This Flutter rebuild keeps the original local-first behavior. Replace this placeholder with the production policy text used by the Kotlin release.'), actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))]));
+  }
+}
+
+class _AboutLinkButton extends StatelessWidget {
+  const _AboutLinkButton({required this.link});
+
+  final _AboutLink link;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      label: link.label,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(22),
+        onTap: () => launchUrl(Uri.parse(link.url), mode: LaunchMode.externalApplication),
+        child: SizedBox(
+          width: 74,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 54,
+                height: 54,
+                decoration: BoxDecoration(
+                  color: scheme.surfaceContainerHighest.withOpacity(0.72),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: scheme.outlineVariant.withOpacity(0.25)),
+                ),
+                child: Icon(link.icon, size: 26, color: scheme.onSurface),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                link.shortLabel,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                      fontWeight: FontWeight.w800,
+                    ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LicensePackageSummary {
+  const _LicensePackageSummary({required this.name, required this.entries});
+
+  final String name;
+  final int entries;
+}
+
+class KoinlyLicenseScreen extends StatefulWidget {
+  const KoinlyLicenseScreen({super.key});
+
+  @override
+  State<KoinlyLicenseScreen> createState() => _KoinlyLicenseScreenState();
+}
+
+class _KoinlyLicenseScreenState extends State<KoinlyLicenseScreen> {
+  late final Future<List<_LicensePackageSummary>> _licensesFuture = _loadLicenseSummaries();
+
+  Future<List<_LicensePackageSummary>> _loadLicenseSummaries() async {
+    final counts = <String, int>{};
+    await for (final entry in LicenseRegistry.licenses) {
+      for (final package in entry.packages) {
+        counts[package] = (counts[package] ?? 0) + 1;
+      }
+    }
+    final summaries = counts.entries
+        .map((entry) => _LicensePackageSummary(name: entry.key, entries: entry.value))
+        .toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+    return summaries;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return PageScaffold(
+      title: 'Licenses',
+      subtitle: 'Open-source notices',
+      child: FutureBuilder<List<_LicensePackageSummary>>(
+        future: _licensesFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          if (snapshot.hasError) {
+            return Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Text(
+                  'Could not load open-source licenses.',
+                  style: Theme.of(context).textTheme.titleMedium,
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            );
+          }
+
+          final licenses = snapshot.data ?? const <_LicensePackageSummary>[];
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final screenWidth = MediaQuery.sizeOf(context).width;
+              final desktop = screenWidth >= AppBreakpoints.expanded;
+              final small = screenWidth < AppBreakpoints.compact;
+              final maxWidth = desktop ? 980.0 : 720.0;
+              final width = math.min(constraints.maxWidth, maxWidth).toDouble();
+              final padding = EdgeInsets.fromLTRB(
+                desktop ? 32 : small ? 14 : 18,
+                desktop ? 22 : 12,
+                desktop ? 32 : small ? 14 : 18,
+                desktop ? 42 : 110,
+              );
+
+              return Align(
+                alignment: Alignment.topCenter,
+                child: SizedBox(
+                  width: width,
+                  child: ListView.builder(
+                    padding: padding,
+                    physics: optimizedScrollPhysics(context),
+                    itemCount: licenses.length + 1,
+                    itemBuilder: (context, index) {
+                      if (index == 0) {
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 16),
+                          child: ExpressiveCard(
+                            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+                            child: Column(
+                              children: [
+                                Container(
+                                  width: 72,
+                                  height: 72,
+                                  decoration: BoxDecoration(
+                                    color: kSleekAccent.withOpacity(.16),
+                                    borderRadius: AppShapes.large,
+                                    border: Border.all(color: kSleekAccent.withOpacity(.22)),
+                                  ),
+                                  child: const Icon(Icons.account_balance_wallet_rounded, color: kSleekAccent, size: 38),
+                                ),
+                                const SizedBox(height: 14),
+                                Text(appTitle, style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900), textAlign: TextAlign.center),
+                                const SizedBox(height: 4),
+                                Text('Version $appVersion', style: Theme.of(context).textTheme.titleMedium?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w800), textAlign: TextAlign.center),
+                                const SizedBox(height: 12),
+                                Text(
+                                  'Powered by Flutter • ${licenses.length} packages with license notices',
+                                  style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ],
+                            ),
+                          ),
+                        );
+                      }
+
+                      final item = licenses[index - 1];
+                      final countLabel = item.entries == 1 ? '1 license' : '${item.entries} licenses';
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: ExpressiveCard(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          child: ListTile(
+                            contentPadding: EdgeInsets.zero,
+                            leading: Container(
+                              width: 48,
+                              height: 48,
+                              decoration: BoxDecoration(
+                                color: kSleekAccent.withOpacity(.14),
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(color: kSleekAccent.withOpacity(.20)),
+                              ),
+                              child: const Icon(Icons.article_rounded, color: kSleekAccent),
+                            ),
+                            title: Text(
+                              item.name,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontWeight: FontWeight.w900),
+                            ),
+                            subtitle: Text(countLabel, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: kSleekMuted, fontWeight: FontWeight.w700)),
+                            trailing: Icon(Icons.chevron_right_rounded, color: scheme.onSurfaceVariant),
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => KoinlyLicenseDetailScreen(packageName: item.name, licenseCount: item.entries)),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class KoinlyLicenseDetailScreen extends StatefulWidget {
+  const KoinlyLicenseDetailScreen({super.key, required this.packageName, required this.licenseCount});
+
+  final String packageName;
+  final int licenseCount;
+
+  @override
+  State<KoinlyLicenseDetailScreen> createState() => _KoinlyLicenseDetailScreenState();
+}
+
+class _KoinlyLicenseDetailScreenState extends State<KoinlyLicenseDetailScreen> {
+  late final Future<List<LicenseEntry>> _entriesFuture = _loadEntries();
+
+  Future<List<LicenseEntry>> _loadEntries() async {
+    final entries = <LicenseEntry>[];
+    await for (final entry in LicenseRegistry.licenses) {
+      if (entry.packages.contains(widget.packageName)) {
+        entries.add(entry);
+      }
+    }
+    return entries;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return PageScaffold(
+      title: widget.packageName,
+      subtitle: widget.licenseCount == 1 ? '1 license notice' : '${widget.licenseCount} license notices',
+      child: FutureBuilder<List<LicenseEntry>>(
+        future: _entriesFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const Center(child: CircularProgressIndicator());
+          }
+          final entries = snapshot.data ?? const <LicenseEntry>[];
+          return LayoutBuilder(
+            builder: (context, constraints) {
+              final screenWidth = MediaQuery.sizeOf(context).width;
+              final desktop = screenWidth >= AppBreakpoints.expanded;
+              final small = screenWidth < AppBreakpoints.compact;
+              final maxWidth = desktop ? 980.0 : 720.0;
+              final width = math.min(constraints.maxWidth, maxWidth).toDouble();
+              final padding = EdgeInsets.fromLTRB(
+                desktop ? 32 : small ? 14 : 18,
+                desktop ? 22 : 12,
+                desktop ? 32 : small ? 14 : 18,
+                desktop ? 42 : 110,
+              );
+
+              return Align(
+                alignment: Alignment.topCenter,
+                child: SizedBox(
+                  width: width,
+                  child: SelectionArea(
+                    child: ListView.builder(
+                      padding: padding,
+                      physics: optimizedScrollPhysics(context),
+                      itemCount: entries.length + 1,
+                      itemBuilder: (context, index) {
+                        if (index == 0) {
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            child: ExpressiveCard(
+                              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 20),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(widget.packageName, style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w900)),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    widget.licenseCount == 1 ? '1 license notice' : '${widget.licenseCount} license notices',
+                                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant, fontWeight: FontWeight.w700),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        }
+
+                        final entry = entries[index - 1];
+                        return Padding(
+                          padding: const EdgeInsets.only(bottom: 14),
+                          child: ExpressiveCard(
+                            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: entry.paragraphs
+                                  .map(
+                                    (paragraph) => Padding(
+                                      padding: EdgeInsets.only(left: paragraph.indent == LicenseParagraph.centeredIndent ? 0 : paragraph.indent * 16.0, bottom: 10),
+                                      child: SelectableText(
+                                        paragraph.text,
+                                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                                              color: scheme.onSurfaceVariant,
+                                              height: 1.42,
+                                              fontWeight: paragraph.indent == LicenseParagraph.centeredIndent ? FontWeight.w800 : FontWeight.w500,
+                                            ),
+                                        textAlign: paragraph.indent == LicenseParagraph.centeredIndent ? TextAlign.center : TextAlign.start,
+                                      ),
+                                    ),
+                                  )
+                                  .toList(),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
   }
 }
