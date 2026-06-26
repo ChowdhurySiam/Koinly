@@ -15,8 +15,8 @@ android {
         applicationId = "com.siamapps.koinly"
         minSdk = 23
         targetSdk = 36
-        versionCode = 68
-        versionName = "1.0.67"
+        versionCode = 1
+        versionName = "1.0.0"
         multiDexEnabled true
     }
 
@@ -30,24 +30,17 @@ android {
         jvmTarget = "17"
     }
 
-    def koinlyBundledReleaseKeystore = file("koinly-release.jks")
-
     signingConfigs {
         release {
-            if (koinlyBundledReleaseKeystore.exists()) {
-                storeFile koinlyBundledReleaseKeystore
-                storePassword "koinly-release"
-                keyAlias "koinly"
-                keyPassword "koinly-release"
-            }
+            // Configure your release signing key before publishing.
         }
     }
 
     buildTypes {
         release {
-            // Use a stable bundled development release key so APKs built on GitHub Actions
-            // can update each other. Random CI debug keys break Android in-place updates.
-            signingConfig koinlyBundledReleaseKeystore.exists() ? signingConfigs.release : signingConfigs.debug
+            // GitHub Actions builds a directly installable release APK with the debug key.
+            // Replace this with your own release keystore before publishing to Play Store.
+            signingConfig signingConfigs.debug
             minifyEnabled false
             shrinkResources false
             proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"

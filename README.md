@@ -1,639 +1,636 @@
 # Koinly Flutter
 
-A local-first personal finance tracker built in Flutter with a polished Material 3 mobile and desktop UI. Koinly helps users manage accounts, transactions, categories, budgets, loans, savings, reminders, reports, exports, local backups, and optional online sync from one Android or Windows app.
+A local-first personal finance tracker built in Flutter with a Material 3 mobile UI. Koinly helps users manage accounts, transactions, budgets, loans, reports, reminders, exports, local backups, and optional online sync from a single Android app.
 
 ![Koinly banner](assets/images/koinly-banner.png)
 
----
-
-## Current app version
-
-- App version: `1.0.67+68`
-- Android `versionName`: `1.0.67`
-- Android `versionCode`: `68`
-- Windows installer output: `KoinlySetup.exe`
-- Every project update must bump `pubspec.yaml`, `android/app/build.gradle`, and `lib/main.dart`.
-
----
-
 ## Project status
+
+This repository contains a Flutter Android app plus an optional Cloudflare Worker + Turso backend for online data sync and admin approval.
 
 | Area | Current implementation |
 | --- | --- |
 | App framework | Flutter / Dart |
-| Platforms | Android and Windows |
-| UI system | Material 3 Expressive-style cards, motion, centered popups, adaptive spacing |
-| Local database | SQLite via `sqflite` and desktop SQLite FFI |
+| Main platform | Android |
+| Local database | SQLite via `sqflite` |
 | State management | `provider` + `ChangeNotifier` |
-| Analytics/crash reporting | Firebase Analytics + Crashlytics with optional initialization |
-| Online sync | Optional cloud/database sync |
-| Visible sync database | MongoDB Database |
-| Hidden/internal providers | Local, Turso, Cloudflare D1, Supabase, Neon, Firebase Firestore placeholders |
-| Admin approval | Admin approval flow with Telegram contact |
-| Backup/restore | Local `.koinlybackup` files |
-| CI build | GitHub Actions for Android APKs and Windows installer |
-| Android outputs | Universal, ARM32, ARM64 release APKs |
-| Windows output | `KoinlySetup.exe` |
+| Analytics/crash reporting | Firebase Analytics + Crashlytics, wrapped in optional initialization |
+| Online sync | Cloudflare Worker API + Turso sync snapshots |
+| Sync approval | Admin panel with `ADMIN_KEY` login, approve/reject/block controls |
+| Backup/restore | Local `.koinlybackup` files using file picker and app document storage |
+| CI build | GitHub Actions workflow for ARM32, ARM64, and universal release APKs |
 | License | Apache License 2.0 |
-
----
-
-## README sync note
-
-This README was rebuilt by comparing the current Koinly version with the uploaded `Koinly-main.zip`.
-
-Kept from the uploaded version where still accurate:
-- clean project status section
-- feature grouping
-- backend setup references
-- build instructions
-- troubleshooting structure
-- API/backend documentation style
-
-Added for the current app:
-- Windows installer workflow and `KoinlySetup.exe`
-- Material 3 Expressive UI behavior
-- Hidden Settings naming
-- single-toggle category and loan filters
-- MongoDB-only visible sync configuration
-- current Sync and Download Data behavior
-- Financial Health Summary popup behavior
-- daily 10 Savings Account suggestion bubbles
-- loan repayment reminders and budget alert summary behavior
-
-Corrected from the older README:
-- Android-only wording was replaced with Android and Windows wording.
-- Old compact home summary wording was not kept as a current feature.
-- Old download-cloud wording was replaced with current Download Data behavior.
-- Outdated sync provider wording was replaced with the current MongoDB-visible flow.
-
----
-
-## Latest changes
-
-### Version 1.0.67+68
-
-- refreshed README against uploaded `Koinly-main.zip`
-- documented the current Android and Windows workflow
-- documented Financial Health Summary period-end popup behavior
-- documented daily 10 Savings Account suggestions
-- documented current sync behavior
-- preserved app icon, signing support, GitHub Actions, and installer workflow
-
-### Version 1.0.66+67
-
-- Savings Accounts page now uses 10 daily suggestions.
-- Suggestion bubbles show as mystery `?` bubbles before tapping.
-- Checked suggestions are saved for the day.
-- After all 10 are checked, suggestions stop until the next day.
-
-### Version 1.0.65+66
-
-- fixed nullable date handling in Analysis chart data.
-- all-time ranges and empty transaction history now use safe chart ranges.
-
-### Version 1.0.64+65
-
-- removed Financial Health Summary from the Analysis page.
-- moved monthly and yearly summaries into end-of-period popup flows.
-- users can review pages or skip all.
-- skipped/reviewed summaries are remembered.
-
-### Version 1.0.62+63 to 1.0.63+64
-
-- added monthly/yearly Financial Health Summary calculations.
-- included income, expense, savings, loans, bills, reminders, and budgets.
-- added yearly month-by-month breakdown and comparison logic.
-- fixed a Dart `num` to `double` chart build failure.
-
-### Version 1.0.60+61 to 1.0.61+62
-
-- removed the extra Savings Accounts tune/filter button.
-- changed savings suggestions so they appear randomly instead of always showing.
-- changed Categories Expense/Income into one toggle button.
-- changed Loans Given/Taken into one toggle button.
-- changed Loans Open/Completed into one toggle button.
-
----
-
-## Core data rules
-
-Koinly is strict about money classification.
-
-- Income counts only as income.
-- Expense counts only as expense.
-- Regular transfers are internal.
-- Savings transfers are internal and never count as income or expense.
-- Given Loans reduce the selected paying account.
-- Taken Loans increase the selected receiving account.
-- Loan principal movement does not inflate income/expense.
-- Loan repayments update loan balance and account balance.
-- Bills and subscriptions are tracked separately for reminders and summaries.
-- Budget usage comes from real expense category spending.
-- Exports follow active filters.
-
----
 
 ## Features
 
-### Accounts
+### Finance management
 
-Koinly supports regular accounts, credit accounts, and Savings accounts. Users can create, edit, delete, reorder, color, and icon-tag accounts. Account balances appear across Home and account pages. Savings balances are kept separate from normal operating balances.
-
-### Transactions
-
-Koinly supports income, expense, and transfer transactions with date/time, amount, account, category, and notes. Filters support date range, account, category, and transaction type. Transfer records avoid category double counting. Savings movements stay out of income/expense totals.
+- Multiple account support, including regular accounts and credit accounts.
+- Account creation, editing, deletion, reordering, icon selection, and color customization.
+- Income, expense, and transfer transactions.
+- Transaction filters by date range, account, category, and transaction type.
+- Default account, default income category, and default expense category settings.
 
 ### Categories
 
-Income and expense categories are managed from one page. Expense/Income uses one toggle button. Category cards use icons and colors. Category detail pages show real category transactions only. Transfer and Savings transfer rows are excluded from category spending pages.
+- Income and expense category management.
+- Custom icons and colors for category cards.
+- Category-level transaction breakdown pages.
+- Seeded default categories for first launch.
 
 ### Budgets
 
-Budgets support monthly limits, category scope, account scope, progress tracking, remaining budget, and alert levels. Status can be safe, warning, near limit, limit reached, or overspent. Budget data is included in Financial Health Summary.
+- Monthly budget creation.
+- Budget scoping by all accounts/categories or selected accounts/categories.
+- Budget progress indicators and budget detail screens.
 
 ### Loans
 
-Loans support Given Loans and Taken Loans. Given/Taken uses one toggle button. Open/Completed uses one toggle button. Given Loan means money goes out; Taken Loan means money comes in. Partial repayments, repayment history, overdue highlighting, and loan repayment reminders are supported. Loan activity is included in Financial Health Summary but excluded from normal income/expense totals.
-
-### Savings
-
-Savings has a dedicated Savings Accounts page. Transfers into and out of Savings are internal transfers. Savings activity appears separately in summaries. Savings suggestion profile is available in Settings. The Savings page shows 10 daily mystery `?` suggestion bubbles. Tapping a bubble opens the full suggestion. Checked suggestions are saved for the day. After all 10 are checked, no more appear until the next day.
-
-### Financial Health Summary
-
-Financial Health Summary is not a fixed Analysis page section. It appears automatically after a month or year ends. Users can go through summary pages or skip all. Skipped and reviewed summaries are remembered.
-
-The summary includes income, expenses, net flow, savings transfers, savings balance movement, current savings balance, loans given/taken, repayments paid/received, recurring bills/subscriptions, paid/unpaid/upcoming/overdue bills, loan repayment reminder status, partial repayments, overdue alerts, budget usage, remaining budget, overspent categories, and a health result.
-
-Possible status results include Saved Money, Overspent, Increased Debt, Reduced Debt, Stable Month, Stable Year, and Strong Savings Growth.
-
-Yearly view includes month-by-month income, expense, savings, loans, repayments, bills, budget usage, best month, worst month, highest income month, highest expense month, highest savings month, and most overspent month.
-
-### Reminders
-
-Reminder-related data supports bills, subscriptions, tuition, rent, internet bills, mobile recharge, electricity bills, EMI payments, scheduled payments, loan repayments, partial repayments, and overdue alerts. Reminder status is included in Financial Health Summary.
+- Separate loan system for money given and money taken.
+- Loan principal balance application to selected accounts.
+- Repayment tracking with account selection.
+- Open/completed loan status handling.
+- Migration cleanup for older hidden loan transaction rows.
 
 ### Analysis and reports
 
-The Analysis page remains focused on charts and analytics: income/expense charting, cash flow trend, category breakdown, budget usage context, filter-aware summaries, responsive chart cards, and Material 3 Expressive-style spacing. Financial Health Summary appears as a period-end popup, not as a permanent Analysis card.
+- Dashboard summary for balance, income, expense, and savings.
+- Analysis page using charts from `fl_chart`.
+- Filter-aware CSV export.
+- Filter-aware PDF export.
+- Share support for generated export files.
 
-### Exports
+### Settings and security
 
-Koinly supports CSV export, PDF export, filter-aware export data, shared export files, and summaries based on active filters.
+- Theme preferences: system, light, dark, and battery-saver/system mode.
+- Currency customization with symbol, code, prefix/suffix placement, and separators.
+- Daily reminder notification.
+- App lock using biometric/device authentication where supported.
+- Compact home summary setting.
+- About, privacy policy placeholder, terms placeholder, and open-source license view.
 
-### Settings
+### Online data sync
 
-Settings includes theme, currency, currency symbol/code, prefix/suffix placement, number separators, daily reminder time, default account, default expense category, default income category, default date filter, Savings suggestion profile, backup/restore, app lock/security, About, privacy policy, terms, and licenses.
-
-### Hidden Settings
-
-Hidden Settings keeps secondary controls away from the main workflow. Examples include defaults, reorder tools, backup tools, lock/security options, and online sync advanced options.
-
----
-
-## Online data sync
-
-Online sync is optional. The app remains local-first.
-
-### Visible database provider
-
-Only this provider is visible to normal users:
-
-```text
-MongoDB Database
-```
-
-### MongoDB configuration
-
-The visible MongoDB provider asks for:
-
-```text
-MongoDB URL
-```
-
-Extra database and collection fields are hidden from regular users.
-
-### Hidden/internal providers
-
-The code keeps placeholders for Local Database, Turso Database, Cloudflare D1, Supabase Postgres, Neon Postgres, and Firebase Firestore. These are not part of the normal visible workflow right now.
-
-### Current sync buttons
-
-| Button | Behavior |
-| --- | --- |
-| Sync | Uploads local data to the configured database/cloud target |
-| Download Data | Downloads/restores cloud data to this device |
-| Download cloud data to this device | Removed |
-
-### Automatic sync
-
-Automatic sync is enabled when a database is configured. The app silently retries when internet returns. Admin approval is respected. Sync errors are shown through app status messages where needed.
-
-### Admin approval
-
-New Sync IDs require admin approval. If approval is missing, the app shows an activation/admin message and a Telegram contact button. Approved users can sync. Rejected or blocked users cannot sync.
+- Settings includes an **Online data sync** screen.
+- Users enter a **Sync ID** and **Sync PIN**.
+- The main action button is **Sync**.
+- The Cloudflare Worker URL is not shown in the app UI. It is compiled into the APK using `KOINLY_SYNC_API_BASE_URL`.
+- New Sync IDs require admin approval before upload/download is allowed.
+- If a Sync ID is not approved, the app shows a popup asking the user to message the admin.
+- The popup contains a **Telegram** button that opens:
 
 ```text
 https://t.me/Ch0wdhury_Siam
 ```
 
-### Sync backend URL
+- Existing users/snapshots already in the Turso database are treated as approved, so they do not need approval again.
+- When automatic sync is enabled, local finance changes are uploaded after a short debounce.
+- Synced payload includes accounts, categories, transactions, budgets, budget relationships, loans, loan repayments, and app preferences.
+- Sync PINs are not stored as plain text by the backend. The Worker stores a salted hash using the `SYNC_SECRET` Worker secret.
 
-The Worker URL is injected at build time:
+### Backup and restore
 
-```bash
---dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
-```
+- Backup files are generated as `.koinlybackup` files.
+- The backup includes database rows and app preferences.
+- Backups are saved through the platform file picker when available and also copied into app document storage under a `backups` folder.
+- Restore opens local storage through the file picker and imports a selected backup file.
 
-GitHub Actions can read it from the manual workflow input `sync_api_base_url`, repository variable `KOINLY_SYNC_API_BASE_URL`, or repository secret `KOINLY_SYNC_API_BASE_URL`.
-
-If empty, the app still builds, but online sync shows a backend URL configuration error until rebuilt with the Worker URL.
-
----
-
-## Backup and restore
-
-Backup files use `.koinlybackup`. Backup includes local app data and preferences. Restore replaces local data with backup contents. Backup/restore works separately from online sync. Local-only use does not require a sync account.
-
----
+> Note: the current backup encoding uses a built-in app constant and lightweight XOR/Base64 obfuscation. Treat backups as private files and do not rely on this as strong cryptographic encryption.
 
 ## Screenshots
 
-Screenshot files are stored in:
+The repository includes polished README screenshots under `assets/images/readme/`.
 
-```text
-assets/images/readme/
-```
-
-Expected screenshots:
-
-```text
-assets/images/readme/home.png
-assets/images/readme/transactions.png
-assets/images/readme/categories.png
-assets/images/readme/loans.png
-assets/images/readme/analysis.png
-```
-
-| Home | Transactions |
-| --- | --- |
-| ![Home](assets/images/readme/home.png) | ![Transactions](assets/images/readme/transactions.png) |
-
-| Categories | Loans |
-| --- | --- |
-| ![Categories](assets/images/readme/categories.png) | ![Loans](assets/images/readme/loans.png) |
-
-| Analysis |
-| --- |
-| ![Analysis](assets/images/readme/analysis.png) |
-
----
+<p align="center">
+  <img src="assets/images/readme/home.png" width="180" alt="Koinly home dashboard" />
+  <img src="assets/images/readme/analysis.png" width="180" alt="Koinly analysis dashboard" />
+  <img src="assets/images/readme/loans.png" width="180" alt="Koinly loans page" />
+  <img src="assets/images/readme/transactions.png" width="180" alt="Koinly transaction list" />
+  <img src="assets/images/readme/categories.png" width="180" alt="Koinly categories breakdown" />
+</p>
 
 ## Tech stack
 
-| Layer | Technology |
-| --- | --- |
-| UI | Flutter |
-| Language | Dart |
-| State | Provider |
-| Local database | SQLite |
-| Android database | `sqflite` |
-| Desktop database | `sqflite_common_ffi` |
-| Charts | `fl_chart` |
-| PDF export | `pdf` + `printing` |
-| File picker | `file_picker` |
-| Sharing | `share_plus` |
-| Secure storage | `flutter_secure_storage` |
-| Biometrics/device auth | `local_auth` |
-| Notifications | `flutter_local_notifications` |
-| Time zones | `timezone` |
-| Firebase | Analytics + Crashlytics |
-| HTTP | `http` |
-| MongoDB | `mongo_dart` |
-| IDs | `uuid` |
-
----
+- **Flutter SDK:** Dart SDK `>=3.4.0 <4.0.0`
+- **Android:** compile SDK 36, target SDK 36, minimum SDK 23
+- **Gradle:** wrapper configured for Gradle 8.14.1
+- **Android Gradle Plugin:** 8.11.1
+- **Kotlin plugin:** 2.2.20
+- **Java:** 17
+- **Database:** `sqflite`
+- **Charts:** `fl_chart`
+- **Exports:** `pdf`, `printing`, `share_plus`
+- **File access:** `file_picker`, `path_provider`
+- **Security:** `local_auth`
+- **Notifications:** `flutter_local_notifications`, `timezone`
+- **Firebase:** `firebase_core`, `firebase_analytics`, `firebase_crashlytics`
+- **Online sync client:** `http`
+- **Online sync backend:** Cloudflare Worker + Turso via `@libsql/client`
 
 ## Project structure
 
 ```text
 .
-├── .github/
-│   └── workflows/
-│       └── build-android-apks.yml
-├── android/
+├── .github/workflows/build-android-apks.yml # GitHub Actions APK build workflow
+├── android/                                # Android native project
 │   └── app/
-├── assets/
-│   ├── icons/
-│   └── images/
-├── backend/
-│   └── cloudflare-turso/
-├── lib/
-│   └── main.dart
-├── tools/
-│   └── windows/
-├── pubspec.yaml
-├── analysis_options.yaml
-├── README.md
-└── LICENSE
+│       ├── build.gradle                    # Android app build configuration
+│       ├── google-services.json            # Firebase Android config
+│       └── src/main/AndroidManifest.xml    # Android permissions and launcher setup
+├── assets/images/                          # Banner, splash, and screenshots
+├── backend/cloudflare-turso/               # Cloudflare Worker, Turso schema, admin panel
+│   ├── src/index.js                        # Worker API and admin panel HTML
+│   ├── package.json                        # Worker dependencies
+│   └── wrangler.toml                       # Cloudflare Worker config
+├── lib/main.dart                           # Main Flutter app, models, DB, UI, services
+├── pubspec.yaml                            # Flutter dependencies and assets
+├── analysis_options.yaml                   # Flutter lint rules
+└── LICENSE                                 # Apache License 2.0
 ```
 
-The app is currently implemented mainly in `lib/main.dart`. GitHub Actions can regenerate platform files where needed. The Windows workflow generates Windows platform files before packaging. The installer artifact remains `KoinlySetup.exe`.
+## Data model
 
----
+The SQLite database is opened as `koinly_flutter.db` and currently uses schema version `5`.
 
-## Data model overview
+Main local tables:
 
-The app stores local data for accounts, categories, transactions, budgets, loans, repayments, loan repayment reminders, savings suggestion profile, daily savings suggestion seen status, settings/preferences, sync configuration, and backup metadata.
+- `accounts`
+- `categories`
+- `transactions`
+- `budgets`
+- `budget_accounts`
+- `budget_categories`
+- `loans`
+- `loan_repayments`
 
-Important classification fields include transaction type, account IDs, category ID, loan metadata, transfer target, created date/time, reminder status, and budget scope.
+The app seeds new installations with default accounts: `Cash`, `Card`, and `Bank Account`, plus default income and expense categories.
 
----
+Main Turso tables are created automatically by the Worker:
+
+- `sync_snapshots`
+- `sync_users`
+
+Manual Turso schema import is not required because the Worker runs `CREATE TABLE IF NOT EXISTS` during requests.
+
+## Android permissions
+
+The app requests these Android permissions:
+
+- `USE_BIOMETRIC`
+- `USE_FINGERPRINT`
+- `POST_NOTIFICATIONS`
+- `SCHEDULE_EXACT_ALARM`
+- `RECEIVE_BOOT_COMPLETED`
+- `READ_EXTERNAL_STORAGE` for Android 12 and below
+- `WRITE_EXTERNAL_STORAGE` for Android 9 and below
+- `INTERNET`
+- `ACCESS_NETWORK_STATE`
+
+These permissions support app lock, reminders, backup/restore file access, notification behavior, and HTTPS online sync.
 
 ## Requirements
 
-Android:
-- Flutter stable
-- Java 17
-- Android SDK/build tools
-- NDK configured by workflow
-- Gradle wrapper restored/configured by workflow
+Install the following before building locally:
 
-Windows:
-- Flutter stable
-- Windows desktop support
-- Visual Studio Build Tools with Desktop C++ workload
-- Inno Setup in CI
-- optional code signing certificate
+- Flutter stable channel with Dart 3.4 or newer.
+- Android Studio or Android SDK command-line tools.
+- Java 17.
+- Android SDK Platform 36 and Build Tools 36.0.0.
+- Android NDK 28.2.13676358 for matching the current Gradle configuration.
+- A Cloudflare account for Worker deployment.
+- A Turso account and database for online sync.
 
----
+## Local Flutter setup
 
-## Local setup
+```bash
+git clone <your-repository-url>
+cd Koinly-Flutter-main
+flutter pub get
+flutter run
+```
 
-Install dependencies:
+If you extracted this project from a ZIP instead of cloning from Git, run the same commands from the project root containing `pubspec.yaml`.
+
+## Cloudflare + Turso backend setup
+
+Backend files are included in:
+
+```text
+backend/cloudflare-turso
+```
+
+### 1. Create a Turso database
+
+```bash
+turso db create koinly-sync
+```
+
+Get the database URL:
+
+```bash
+turso db show koinly-sync --url
+```
+
+Create a database token:
+
+```bash
+turso db tokens create koinly-sync
+```
+
+Save these values for Cloudflare secrets:
+
+```text
+TURSO_DATABASE_URL=<your Turso database URL>
+TURSO_AUTH_TOKEN=<your Turso database token>
+```
+
+### 2. Add Cloudflare Worker secrets
+
+Required secrets:
+
+```text
+TURSO_DATABASE_URL
+TURSO_AUTH_TOKEN
+SYNC_SECRET
+ADMIN_KEY
+```
+
+Recommended values:
+
+```text
+SYNC_SECRET=<long random private string>
+ADMIN_KEY=<your private admin login key>
+```
+
+`ADMIN_KEY` is used to log in to the admin panel at `/admin`.
+
+### 3. Deploy from Cloudflare website
+
+In Cloudflare Dashboard, create a Worker connected to your GitHub repository and use this build configuration:
+
+| Field | Value |
+| --- | --- |
+| **Path / Root directory** | `backend/cloudflare-turso` |
+| **Build command** | `npm install` |
+| **Deploy command** | `npx wrangler deploy --config wrangler.toml` |
+| **Non-production branch deploy command** | `npx wrangler deploy --config wrangler.toml` |
+| **Build output directory** | Leave empty |
+| **Framework preset** | None / Worker |
+
+Make sure this file exists in GitHub:
+
+```text
+backend/cloudflare-turso/wrangler.toml
+```
+
+Expected content:
+
+```toml
+name = "koinly-sync"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+```
+
+### 4. Deploy from terminal instead
+
+```bash
+cd backend/cloudflare-turso
+npm install
+npx wrangler secret put TURSO_DATABASE_URL
+npx wrangler secret put TURSO_AUTH_TOKEN
+npx wrangler secret put SYNC_SECRET
+npx wrangler secret put ADMIN_KEY
+npx wrangler deploy --config wrangler.toml
+```
+
+### 5. Test the Worker
+
+Open:
+
+```text
+https://<your-worker>.workers.dev/
+```
+
+Expected response:
+
+```json
+{
+  "ok": true,
+  "service": "koinly-sync",
+  "admin": "https://<your-worker>.workers.dev/admin"
+}
+```
+
+## Admin panel
+
+The admin panel is served by the Worker:
+
+```text
+https://<your-worker>.workers.dev/admin
+```
+
+Login with the value of the Cloudflare secret:
+
+```text
+ADMIN_KEY
+```
+
+After login, the panel shows Sync IDs and metadata. It does not show finance payload contents.
+
+Admin actions:
+
+| Action | Result |
+| --- | --- |
+| **Approve** | Allows the Sync ID to upload/download cloud data. |
+| **Reject** | Denies the current request. User can message admin if needed. |
+| **Block** | Prevents the Sync ID from syncing. |
+| **Delete** | Removes the Sync ID approval record and stored snapshot. |
+
+Existing users/snapshots already present in Turso are automatically migrated to approved status, so old users do not need approval again.
+
+## Online sync user flow
+
+1. Build the APK with `KOINLY_SYNC_API_BASE_URL`.
+2. Open the app.
+3. Go to:
+
+```text
+Settings → Online data sync
+```
+
+4. Enable automatic sync if desired.
+5. Enter a Sync ID and Sync PIN.
+6. Tap **Sync**.
+7. If the Sync ID is new, the app creates a pending request and shows:
+
+```text
+Message admin to activate your online sync.
+```
+
+8. The user can tap **Telegram** to message:
+
+```text
+https://t.me/Ch0wdhury_Siam
+```
+
+9. Admin opens `/admin`, logs in with `ADMIN_KEY`, then approves the Sync ID.
+10. User taps **Sync** again, or uses **Upload local data now**.
+11. On another device, use the same Sync ID and PIN, then tap **Download cloud data to this device**.
+
+> Conflict handling is last-upload-wins. For two-device use, download the latest cloud snapshot before editing on the second device.
+
+## Build APK locally
+
+The Worker URL is a build-time variable. The app does not show a field for it.
+
+Run dependency resolution first:
 
 ```bash
 flutter pub get
 ```
 
-Run Android:
+### Universal release APK
 
 ```bash
-flutter run
+flutter build apk \
+  --release \
+  --target-platform android-arm,android-arm64 \
+  --no-tree-shake-icons \
+  --dart-define=KOINLY_SYNC_API_BASE_URL=https://<your-worker>.workers.dev
 ```
 
-Run Windows:
+Output:
+
+```text
+build/app/outputs/flutter-apk/app-release.apk
+```
+
+### ARM32 and ARM64 split APKs
 
 ```bash
-flutter config --enable-windows-desktop
-flutter run -d windows
+flutter build apk \
+  --release \
+  --split-per-abi \
+  --target-platform android-arm,android-arm64 \
+  --no-tree-shake-icons \
+  --dart-define=KOINLY_SYNC_API_BASE_URL=https://<your-worker>.workers.dev
 ```
 
-Build universal APK:
+Outputs:
 
-```bash
-flutter build apk --release \
-  --dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
+```text
+build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 ```
 
-Build ARM32/ARM64 APKs:
+Recommended APK choice:
 
-```bash
-flutter build apk --release --split-per-abi \
-  --dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
-```
+| APK | Use case |
+| --- | --- |
+| `app-arm64-v8a-release.apk` | Modern 64-bit Android phones. Smallest recommended APK for most users. |
+| `app-armeabi-v7a-release.apk` | Older 32-bit Android phones. |
+| `app-release.apk` | Universal APK for broad compatibility. Larger file size. |
 
-Build Windows release:
+If you build without `KOINLY_SYNC_API_BASE_URL`, online sync will not work until the APK is rebuilt with a Worker URL.
 
-```bash
-flutter build windows --release \
-  --dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
-```
+## GitHub Actions APK build
 
----
-
-## GitHub Actions build
-
-Workflow:
+The repository includes:
 
 ```text
 .github/workflows/build-android-apks.yml
 ```
 
-The workflow builds:
+Add this repository variable before running the workflow:
 
 ```text
-artifacts/koinly-universal-release.apk
-artifacts/koinly-armeabi-v7a-release.apk
-artifacts/koinly-arm64-v8a-release.apk
-artifacts/KoinlySetup.exe
+KOINLY_SYNC_API_BASE_URL=https://<your-worker>.workers.dev
 ```
 
-Workflow behavior:
-- supports manual dispatch
-- supports push to `main` or `master`
-- accepts optional Worker URL input
-- preserves Android signing support
-- preserves Windows signing support
-- generates Windows installer
-- patches Windows CMake compatibility where needed
-
-The installer filename must stay:
+Path:
 
 ```text
-KoinlySetup.exe
+GitHub repo → Settings → Secrets and variables → Actions → Variables → New repository variable
 ```
 
----
+The workflow builds three release APK artifacts:
 
-## Release signing
+| Artifact file | Target |
+| --- | --- |
+| `koinly-arm64-v8a-release.apk` | ARM64 / modern Android devices |
+| `koinly-armeabi-v7a-release.apk` | ARM32 / older Android devices |
+| `koinly-universal-release.apk` | Universal APK for broad compatibility |
 
-Android release signing support is preserved.
+The workflow:
 
-Typical Android secret names:
+1. Checks out the repository.
+2. Sets up Java 17.
+3. Installs Android SDK 36, Build Tools 36.0.0, and NDK 28.2.13676358.
+4. Sets up Flutter stable.
+5. Forces Gradle wrapper 8.14.1.
+6. Runs `flutter pub get`.
+7. Builds a universal release APK.
+8. Builds ARM32 and ARM64 split release APKs.
+9. Uploads all three APKs as a GitHub Actions artifact named `koinly-release-apks`.
+
+The workflow runs on pushes to `main` or `master` when app files change, and it can also be started manually from the GitHub Actions tab. Manual runs can override `KOINLY_SYNC_API_BASE_URL` with the workflow input.
+
+## Firebase configuration
+
+The project contains Firebase dependencies and an Android `google-services.json` file for Analytics and Crashlytics. At runtime, Firebase initialization is wrapped in a `try/catch`, so the app code is designed to continue even if Firebase initialization fails.
+
+For your own Firebase project:
+
+1. Create or open a Firebase project.
+2. Add an Android app with package name:
 
 ```text
-ANDROID_KEYSTORE_BASE64
-ANDROID_KEYSTORE_PASSWORD
-ANDROID_KEY_ALIAS
-ANDROID_KEY_PASSWORD
+com.siamapps.koinly
 ```
 
-Windows code signing is optional.
-
-Typical Windows secret names:
-
-```text
-WINDOWS_CODESIGN_PFX_BASE64
-WINDOWS_CODESIGN_PASSWORD
-WINDOWS_CODESIGN_TIMESTAMP_URL
-```
-
-If Windows signing is not configured, the installer still builds, but Windows may show SmartScreen warnings.
-
----
-
-## Cloudflare + Turso backend
-
-Backend folder:
-
-```text
-backend/cloudflare-turso/
-```
-
-It contains Worker source, schema, package configuration, and deployment reference files.
-
-Backend files:
-
-```text
-backend/cloudflare-turso/src/index.js
-backend/cloudflare-turso/schema.sql
-backend/cloudflare-turso/package.json
-backend/cloudflare-turso/wrangler.toml.example
-```
-
-Typical Worker secrets:
-
-```text
-ADMIN_KEY
-TURSO_DATABASE_URL
-TURSO_AUTH_TOKEN
-```
-
-Deploy from terminal:
-
-```bash
-cd backend/cloudflare-turso
-npm install
-npx wrangler deploy
-```
-
-After deployment, rebuild the app with:
-
-```bash
---dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
-```
-
----
-
-## Admin panel
-
-The backend includes admin approval tools. Admin actions include login with `ADMIN_KEY`, view pending Sync IDs, approve users, reject users, block users, and inspect sync status.
-
----
-
-## Online sync user flow
-
-1. User opens Online Data Sync.
-2. User configures Sync ID/PIN where required.
-3. User configures the visible database provider.
-4. User taps Sync.
-5. The app uploads local data.
-6. If approval is missing, the app asks the user to contact admin.
-7. Admin approves the Sync ID.
-8. User can upload and download data.
-9. Automatic sync retries silently when internet returns.
-
----
-
-## API endpoints
-
-Backend endpoint definitions are in:
-
-```text
-backend/cloudflare-turso/src/index.js
-```
-
-Endpoint groups may include health/status, sync upload, sync download, approval status, admin login, and approve/reject/block actions.
-
----
-
-## Troubleshooting
-
-### `KOINLY_SYNC_API_BASE_URL is empty`
-
-This is a build warning, not a build failure. The app builds, but online sync will not work until rebuilt with a Worker URL.
-
-### `Cloud sync backend URL is not configured in this app`
-
-Rebuild with:
-
-```bash
---dart-define=KOINLY_SYNC_API_BASE_URL=https://your-worker-url.workers.dev
-```
-
-### User sees admin activation message
-
-The Sync ID is not approved. Approve it from the admin panel.
-
-### Admin panel says unauthorized
-
-Check `ADMIN_KEY`.
-
-### SQLite table errors in backend
-
-Check schema, database credentials, Worker bindings, and deployment target.
-
-### Android build fails after Flutter upgrade
-
-Check Gradle wrapper, Android Gradle Plugin, Kotlin Gradle Plugin warnings, plugin compatibility, Java 17, SDK, and NDK setup.
-
-### Kotlin Gradle Plugin warning
-
-Flutter may warn that the Android app or plugins apply KGP. The current build can still succeed unless Flutter changes enforcement.
-
-### Windows CMake warning
-
-Firebase's bundled Windows C++ SDK may show old CMake policy warnings. The workflow patches Windows CMake files during CI.
-
-### `KoinlySetup.exe` is missing
-
-Check Windows platform generation, Flutter Windows build, Inno Setup, installer script output, and artifact path.
-
-Expected path:
-
-```text
-artifacts/KoinlySetup.exe
-```
-
-### Firebase build errors
-
-Check:
+3. Download the new `google-services.json`.
+4. Replace:
 
 ```text
 android/app/google-services.json
 ```
 
-### Release APK signing problem
+5. Rebuild the app.
 
-Check Android signing secrets and Gradle signing configuration.
+## API endpoints
 
----
+The Worker exposes these endpoints:
 
-## Development rules
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Health check and admin URL. |
+| `GET` | `/admin` | Admin panel UI. |
+| `POST` | `/api/sync/push` | Upload a full encrypted/encoded finance snapshot. |
+| `POST` | `/api/sync/pull` | Download the latest snapshot for a Sync ID. |
+| `GET` | `/api/admin/overview` | Admin metadata list. Requires `ADMIN_KEY`. |
+| `POST` | `/api/admin/user-status` | Approve/reject/block Sync ID. Requires `ADMIN_KEY`. |
+| `POST` | `/api/admin/delete` | Delete Sync ID and snapshot. Requires `ADMIN_KEY`. |
 
-- Keep Koinly local-first.
-- Do not count Savings transfers as income or expense.
-- Do not count loan principal movement as income or expense.
-- Keep centered popup windows.
-- Keep Apple Clock-style wheel pickers where used.
-- Keep Material 3 Expressive-style UI.
-- Keep the app icon assets.
-- Keep Android release signing support.
-- Keep Windows installer generation.
-- Keep installer name `KoinlySetup.exe`.
-- Keep GitHub Actions building Android universal, ARM32, ARM64, and Windows installer.
-- Bump the version for every update.
+## Troubleshooting
 
----
+### `SQLITE_UNKNOWN: SQLite error: no such table: sync_snapshots`
+
+Redeploy the latest Worker. The current Worker auto-creates both Turso tables:
+
+```text
+sync_snapshots
+sync_users
+```
+
+If the error still appears, confirm that the Worker is connected to the correct Turso database and that these secrets are set:
+
+```text
+TURSO_DATABASE_URL
+TURSO_AUTH_TOKEN
+SYNC_SECRET
+ADMIN_KEY
+```
+
+### `Cloud sync backend URL is not configured in this APK`
+
+Rebuild the APK with:
+
+```bash
+flutter build apk --release --no-tree-shake-icons \
+  --dart-define=KOINLY_SYNC_API_BASE_URL=https://<your-worker>.workers.dev
+```
+
+### Admin panel says unauthorized
+
+Use the same value you stored in the Cloudflare secret:
+
+```text
+ADMIN_KEY
+```
+
+If you recently changed `ADMIN_KEY`, redeploy the Worker and log in again.
+
+### User sees `Message admin to activate your online sync.`
+
+This is expected for a new Sync ID. Open the admin panel and click **Approve**.
+
+### User was approved before but now cannot sync
+
+Check the user status in `/admin`:
+
+- `approved` can sync.
+- `rejected` cannot sync until approved.
+- `blocked` cannot sync until approved again.
+- `pending` needs approval.
+
+### Cloudflare deploy says static files cannot be detected
+
+Use a Worker deployment, not a Pages static-site deployment. Also confirm that this file exists:
+
+```text
+backend/cloudflare-turso/wrangler.toml
+```
+
+and use:
+
+```bash
+npx wrangler deploy --config wrangler.toml
+```
+
+### `flutter.sdk not set in local.properties`
+
+This appears when Android Gradle is run before Flutter creates `android/local.properties`.
+
+Run:
+
+```bash
+flutter pub get
+flutter build apk --release
+```
+
+Flutter will generate `android/local.properties` automatically.
+
+### Android SDK or NDK mismatch
+
+The project expects:
+
+```text
+compileSdk = 36
+targetSdk = 36
+ndkVersion = 28.2.13676358
+```
+
+Install the matching Android SDK packages from Android Studio SDK Manager or `sdkmanager`.
+
+### Firebase build errors
+
+Confirm that this file exists:
+
+```text
+android/app/google-services.json
+```
+
+If you changed the package name, regenerate this file from Firebase using the new Android application ID.
+
+### Release APK is signed with debug key
+
+This is expected for the current CI workflow. Configure a release keystore before public distribution.
+
+## Development notes
+
+- The app is currently monolithic: most models, services, state controller, database logic, and UI screens live in `lib/main.dart`.
+- There is no `pubspec.lock` in this package. Run `flutter pub get` to generate it.
+- Firebase is optional for local-only use.
+- Online sync requires a deployed Cloudflare Worker URL passed into the APK through `KOINLY_SYNC_API_BASE_URL` and a configured Turso database.
+- Backup files are local files; online sync stores full JSON snapshots in the Turso `sync_snapshots` table.
+- Placeholder legal text is present inside the app and should be replaced before production release.
+
+## Release signing note
+
+The current Android release configuration signs release APKs with the debug signing config so GitHub Actions can produce a directly installable APK without extra secrets.
+
+Before publishing to Google Play or another public app store, replace the debug signing config with a real release keystore and keep keystore passwords outside the repository.
 
 ## License
 
-Apache License 2.0.
-
-See:
-
-```text
-LICENSE
-```
+This project includes an Apache License 2.0 license file. See [`LICENSE`](LICENSE) for the full license text.
