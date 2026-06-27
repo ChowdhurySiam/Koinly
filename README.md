@@ -61,81 +61,6 @@ Added for the current app:
 - daily 10 Savings Account suggestion bubbles
 - loan repayment reminders and budget alert summary behavior
 
-Corrected from the older README:
-- Android-only wording was replaced with Android and Windows wording.
-- Old compact home summary wording was not kept as a current feature.
-- Old download-cloud wording was replaced with current Download Data behavior.
-- Outdated sync provider wording was replaced with the current MongoDB-visible flow.
-
----
-
-## Latest changes
-
-### Version 1.0.70+71
-
-- fixed and normalized README length to approximately 700 lines.
-- kept the current Sync downloads and Upload Data uploads behavior documented.
-- preserved Android universal, ARM32, ARM64, and Windows installer workflow documentation.
-- bumped project version after the documentation update.
-
-### Version 1.0.69+70
-
-- changed the Sync button so it downloads/restores the latest data from the configured database to this device
-- renamed Download Data to Upload Data
-- changed Upload Data so it uploads this device’s local data to the configured database
-- applied the same Sync/Upload Data behavior to database method pages
-- preserved automatic sync, database configuration, and existing workflow
-
-### Version 1.0.68+69
-
-- removed visible scrollbars from app scrolling on desktop and mobile
-- kept mouse, touch, trackpad, stylus, and unknown pointer scrolling support
-- preserved existing desktop/mobile scroll physics and page workflows
-
-### Version 1.0.67+68
-
-- refreshed README against uploaded `Koinly-main.zip`
-- documented the current Android and Windows workflow
-- documented Financial Health Summary period-end popup behavior
-- documented daily 10 Savings Account suggestions
-- documented current sync behavior
-- preserved app icon, signing support, GitHub Actions, and installer workflow
-
-### Version 1.0.66+67
-
-- Savings Accounts page now uses 10 daily suggestions.
-- Suggestion bubbles show as mystery `?` bubbles before tapping.
-- Checked suggestions are saved for the day.
-- After all 10 are checked, suggestions stop until the next day.
-
-### Version 1.0.65+66
-
-- fixed nullable date handling in Analysis chart data.
-- all-time ranges and empty transaction history now use safe chart ranges.
-
-### Version 1.0.64+65
-
-- removed Financial Health Summary from the Analysis page.
-- moved monthly and yearly summaries into end-of-period popup flows.
-- users can review pages or skip all.
-- skipped/reviewed summaries are remembered.
-
-### Version 1.0.62+63 to 1.0.63+64
-
-- added monthly/yearly Financial Health Summary calculations.
-- included income, expense, savings, loans, bills, reminders, and budgets.
-- added yearly month-by-month breakdown and comparison logic.
-- fixed a Dart `num` to `double` chart build failure.
-
-### Version 1.0.60+61 to 1.0.61+62
-
-- removed the extra Savings Accounts tune/filter button.
-- changed savings suggestions so they appear randomly instead of always showing.
-- changed Categories Expense/Income into one toggle button.
-- changed Loans Given/Taken into one toggle button.
-- changed Loans Open/Completed into one toggle button.
-
----
 
 ## Core data rules
 
@@ -281,22 +206,6 @@ Backup files use `.koinlybackup`. Backup includes local app data and preferences
 ---
 
 ## Screenshots
-
-Screenshot files are stored in:
-
-```text
-assets/images/readme/
-```
-
-Expected screenshots:
-
-```text
-assets/images/readme/home.png
-assets/images/readme/transactions.png
-assets/images/readme/categories.png
-assets/images/readme/loans.png
-assets/images/readme/analysis.png
-```
 
 | Home | Transactions |
 | --- | --- |
@@ -630,62 +539,6 @@ android/app/google-services.json
 ### Release APK signing problem
 
 Check Android signing secrets and Gradle signing configuration.
-
----
-
-## Development rules
-
-- Keep Koinly local-first.
-- Do not count Savings transfers as income or expense.
-- Do not count loan principal movement as income or expense.
-- Keep centered popup windows.
-- Keep Apple Clock-style wheel pickers where used.
-- Keep Material 3 Expressive-style UI.
-- Keep the app icon assets.
-- Keep Android release signing support.
-- Keep Windows installer generation.
-- Keep installer name `KoinlySetup.exe`.
-- Keep GitHub Actions building Android universal, ARM32, ARM64, and Windows installer.
-- Bump the version for every update.
-
-## README maintenance checklist
-
-- Verify `pubspec.yaml` version before every release.
-- Verify `lib/main.dart` appVersion matches the release version.
-- Verify Android `versionCode` increases by one.
-- Verify Android `versionName` matches the public version.
-- Keep `KoinlySetup.exe` as the Windows installer filename.
-- Keep GitHub Actions building universal APK.
-- Keep GitHub Actions building ARM32 APK.
-- Keep GitHub Actions building ARM64 APK.
-- Keep GitHub Actions building Windows installer.
-- Keep Android release signing support intact.
-- Keep optional Windows signing support intact.
-- Keep the app icon assets intact.
-- Keep Material 3 Expressive-style cards and spacing.
-- Keep centered popup windows.
-- Keep Apple Clock-style pickers where used.
-- Keep Savings transfers internal.
-- Do not count Savings transfers as income.
-- Do not count Savings transfers as expense.
-- Keep loan principal outside income/expense totals.
-- Keep loan repayments updating loan balances.
-- Keep Sync documented as database download/restore.
-- Keep Upload Data documented as local upload.
-- Keep Download Data documented as renamed.
-- Keep MongoDB as the visible sync provider.
-- Keep hidden database providers documented as internal placeholders.
-- Keep admin approval flow documented.
-- Keep Telegram admin contact documented.
-- Keep automatic sync retry behavior documented.
-- Keep Financial Health Summary as a period-end popup.
-- Do not place Financial Health Summary as a fixed Analysis card.
-- Keep Savings suggestions as mystery `?` bubbles.
-- Keep daily Savings suggestions capped at 10 checked items.
-- Keep checked Savings suggestions hidden until the next day.
-- Keep export behavior filter-aware.
-- Keep budget overspending behavior documented.
-- Keep loan repayment reminders documented.
 
 ---
 
